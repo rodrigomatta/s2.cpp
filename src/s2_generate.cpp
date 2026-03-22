@@ -3,6 +3,7 @@
 #include <limits>
 #include <algorithm>
 #include <cmath>
+#include <random>
 
 namespace s2 {
 
@@ -12,6 +13,14 @@ GenerateResult generate(
     const PromptTensor & prompt,
     const GenerateParams & params
 ) {
+    // Initialize RNG
+    std::mt19937 gen;
+    if (params.seed >= 0) {
+        gen.seed(static_cast<unsigned int>(params.seed));
+    } else {
+        gen.seed(std::random_device{}());
+    }
+
     GenerateResult out;
     out.num_codebooks = model.hparams().num_codebooks;
     if (out.num_codebooks <= 0) out.num_codebooks = 1;
@@ -71,7 +80,7 @@ GenerateResult generate(
         // Pass im_end_id so it is always eligible for sampling when not blocked,
         // regardless of GPU numerical precision (fixes NVIDIA/NV_coopmat2 EOS dropout).
         const int32_t force_id = block_im_end ? -1 : im_end_id;
-        return sample_token(biased.data(), vocab_size, sparams, force_id);
+        return sample_token(biased.data(), vocab_size, sparams, gen, force_id);
     };
 
     // Sample first main_token
@@ -90,10 +99,7 @@ GenerateResult generate(
     sparams.top_k       = params.top_k;
 
     // RAS state
-    std::vector<int32_t> ras_window;
-    const int32_t ras_window_size = 10;
-    const float ras_high_temp     = 1.0f;
-    const float ras_high_top_p    = 0.9f;
+    RASSampler ras(10, 1.0f, 0.9f);
 
     if (params.verbose) {
         std::cout << "[Generate] Generating (max " << params.max_new_tokens << " tokens)..." << std::endl;
@@ -101,32 +107,8 @@ GenerateResult generate(
 
     int32_t step = 0;
     while (main_token != im_end_id && step < params.max_new_tokens) {
-        // RAS check
-        if (!ras_window.empty() &&
-            std::find(ras_window.begin(), ras_window.end(), main_token) != ras_window.end() &&
-            main_token >= sem_begin && main_token <= sem_end)
-        {
-            // Resample with high temperature
-            std::vector<float> biased(vocab_size);
-            for (int32_t i = 0; i < vocab_size; ++i) {
-                biased[i] = state.logits[i] + sem_mask[i];
-            }
-            if (step < params.min_tokens_before_end && im_end_id >= 0 && im_end_id < vocab_size) {
-                biased[im_end_id] = -std::numeric_limits<float>::infinity();
-            }
-            SamplerParams ras_sparams;
-            ras_sparams.temperature = ras_high_temp;
-            ras_sparams.top_p       = ras_high_top_p;
-            ras_sparams.top_k       = params.top_k;
-            const int32_t ras_force_id = (step < params.min_tokens_before_end) ? -1 : im_end_id;
-            main_token = sample_token(biased.data(), vocab_size, ras_sparams, ras_force_id);
-        }
-
-        // Update RAS window
-        ras_window.push_back(main_token);
-        if ((int32_t)ras_window.size() > ras_window_size) {
-            ras_window.erase(ras_window.begin());
-        }
+        // RAS check & Sample next token
+        main_token = ras.sample(state.logits.data(), vocab_size, sparams, gen, sem_begin, sem_end);
 
         // sem_code: convert from vocabulary space to codebook space
         int32_t sem_code = main_token - sem_begin;
@@ -150,7 +132,7 @@ GenerateResult generate(
                 }
                 break;
             }
-            int32_t cb_token = sample_token(fast_logits.data(), (int32_t)fast_logits.size(), sparams);
+            int32_t cb_token = sample_token(fast_logits.data(), (int32_t)fast_logits.size(), sparams, gen);
             codebooks_cb.push_back(cb_token);
         }
 

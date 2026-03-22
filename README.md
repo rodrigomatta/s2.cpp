@@ -27,10 +27,10 @@ The engine runs the full pipeline: text → tokens → Slow-AR transformer (with
 
 GGUF files are available at [rodrigomt/s2-pro-gguf](https://huggingface.co/rodrigomt/s2-pro-gguf) on Hugging Face.
 
-| File | Size | Notes |
-|---|---|---|
-| `s2-pro-f16.gguf` | 9.3 GB | Full precision — reference quality |
-| `s2-pro-q8_0.gguf` | 5.7 GB | Near-lossless — recommended for 8+ GB VRAM |
+| File               | Size   | Notes                                                  |
+| ------------------ | ------ | ------------------------------------------------------ |
+| `s2-pro-f16.gguf`  | 9.3 GB | Full precision — reference quality                     |
+| `s2-pro-q8_0.gguf` | 5.7 GB | Near-lossless — recommended for 8+ GB VRAM             |
 | `s2-pro-q6_k.gguf` | 4.8 GB | Good quality/size balance — recommended for 6+ GB VRAM |
 
 All variants include both the transformer weights and the audio codec in a single file.
@@ -45,7 +45,7 @@ All variants include both the transformer weights and the audio codec in a singl
 - C++17 compiler (GCC ≥ 10, Clang ≥ 11, MSVC 2019+)
 - For Vulkan GPU support: Vulkan SDK and `glslc`
 - For CUDA GPU support: CUDA Toolkit ≥ 12.4
-  - **MSVC 2019+ note:** MSVC 2019 and later require CUDA ≥ 12.4 when building GGML. Older CUDA versions will produce compiler compatibility errors; upgrade to 12.4+ to resolve them.
+    - **MSVC 2019+ note:** MSVC 2019 and later require CUDA ≥ 12.4 when building GGML. Older CUDA versions will produce compiler compatibility errors; upgrade to 12.4+ to resolve them.
 
 ```bash
 # Ubuntu / Debian
@@ -163,31 +163,31 @@ Provide a short reference clip (5–30 seconds, WAV or MP3) and a transcript of 
 
 ### All options
 
-| Flag | Default | Description |
-|---|---|---|
-| `-m`, `--model` | `model.gguf` | Path to GGUF model file |
-| `-t`, `--tokenizer` | `tokenizer.json` | Path to tokenizer.json |
-| `-text` | `"Hello world"` | Text to synthesize |
-| `-pa`, `--prompt-audio` | — | Reference audio file for voice cloning (WAV/MP3) |
-| `-pt`, `--prompt-text` | — | Transcript of the reference audio |
-| `-o`, `--output` | `out.wav` | Output WAV file path |
-| `--vulkan N` | — | Use Vulkan backend, device index N (e.g. `--vulkan 0`) |
-| `--cuda N` | — | Use CUDA backend, device index N (e.g. `--cuda 0`) |
-| `-threads N` | `4` | Number of CPU threads |
-| `-max-tokens N` | `512` | Max tokens to generate (~21s of audio per 440 tokens) |
-| `-temp F` | `0.7` | Sampling temperature |
-| `-top-p F` | `0.7` | Top-p nucleus sampling |
-| `-top-k N` | `30` | Top-k sampling |
+| Flag                    | Default          | Description                                            |
+| ----------------------- | ---------------- | ------------------------------------------------------ |
+| `-m`, `--model`         | `model.gguf`     | Path to GGUF model file                                |
+| `-t`, `--tokenizer`     | `tokenizer.json` | Path to tokenizer.json                                 |
+| `-text`                 | `"Hello world"`  | Text to synthesize                                     |
+| `-pa`, `--prompt-audio` | —                | Reference audio file for voice cloning (WAV/MP3)       |
+| `-pt`, `--prompt-text`  | —                | Transcript of the reference audio                      |
+| `-o`, `--output`        | `out.wav`        | Output WAV file path                                   |
+| `--vulkan N`            | —                | Use Vulkan backend, device index N (e.g. `--vulkan 0`) |
+| `--cuda N`              | —                | Use CUDA backend, device index N (e.g. `--cuda 0`)     |
+| `-threads N`            | `4`              | Number of CPU threads                                  |
+| `-max-tokens N`         | `512`            | Max tokens to generate (~21s of audio per 440 tokens)  |
+| `-temp F`               | `0.7`            | Sampling temperature                                   |
+| `-top-p F`              | `0.7`            | Top-p nucleus sampling                                 |
+| `-top-k N`              | `30`             | Top-k sampling                                         |
 
 ---
 
 ## Choosing a model
 
-| VRAM available | Recommended model |
-|---|---|
-| ≥ 10 GB | `q8_0` — near-lossless quality |
-| 6–9 GB | `q6_k` — good quality/size balance |
-| < 6 GB | `f16` on CPU (slow) — no GPU variant at this quality level is currently available |
+| VRAM available | Recommended model                                                                 |
+| -------------- | --------------------------------------------------------------------------------- |
+| ≥ 10 GB        | `q8_0` — near-lossless quality                                                    |
+| 6–9 GB         | `q6_k` — good quality/size balance                                                |
+| < 6 GB         | `f16` on CPU (slow) — no GPU variant at this quality level is currently available |
 
 VRAM usage at runtime is approximately equal to the file size (transformer weights only; codec runs on CPU).
 
@@ -234,10 +234,41 @@ The model weights and associated materials are licensed under the **Fish Audio R
 - **Research and non-commercial use:** free, under the terms of this Agreement
 - **Commercial use:** requires a separate written license from Fish Audio
 - When distributing, you must include a copy of the license and the attribution notice
-- Attribution: *"This model is licensed under the Fish Audio Research License, Copyright © 39 AI, INC. All Rights Reserved."*
+- Attribution: _"This model is licensed under the Fish Audio Research License, Copyright © 39 AI, INC. All Rights Reserved."_
 
 Full license: [LICENSE.md](LICENSE.md)
 
 Commercial licensing: [https://fish.audio](https://fish.audio) · [business@fish.audio](mailto:business@fish.audio)
 
 The inference engine source code (`src/`) is a Derivative Work of the Fish Audio Materials as defined in the Agreement and is distributed under the same Fish Audio Research License terms.
+
+---
+
+## WebUI
+
+A graphical interface is available via `app.py`.
+
+### Install Dependencies
+
+```bash
+pip install gradio
+```
+
+### Run the WebUI
+
+```bash
+python app.py
+```
+
+or run start_webui.bat
+
+Then open [http://localhost:7860](http://localhost:7860) in your browser.
+
+### Features
+
+- **Easy Synthesis**: Type text and click "Synthesize"
+- **Voice Cloning**: Upload a reference audio clip and provide its transcript in the "Voice Cloning" accordion
+- **Backend Selection**: Switch between CPU, CUDA, and Vulkan
+- **Adjustable Tokens**: Control the chunk size for long-form generation
+
+> Ensure you have your `.gguf` model file in the `models` folder

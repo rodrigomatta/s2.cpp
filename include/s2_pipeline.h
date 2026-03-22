@@ -31,6 +31,7 @@ struct PipelineParams {
     // Backend
     int32_t gpu_device = -1;   // -1 = CPU only
     int32_t backend_type = -1; //0 = Vulkan; 1 = Cuda;
+    bool split_sentences = true; // Always true, kept for compatibility
 };
 
 class Pipeline {
@@ -49,6 +50,8 @@ private:
     SlowARModel model_;
     AudioCodec  codec_;
     bool initialized_ = false;
+
+    std::vector<std::string> split_text_into_chunks(const std::string & text, int32_t max_new_tokens, bool split_sentences);
 };
 
 } // namespace s2

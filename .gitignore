@@ -8,3 +8,12 @@ build/
 *.d
 compile_commands.json
 .cache/
+.temp_outputs/
+__pycache__/
+*.pyc
+*.bat
+voices/*.txt
+voices/*.wav
+voices/*.mp3
+voices/*.flac
+outputs/

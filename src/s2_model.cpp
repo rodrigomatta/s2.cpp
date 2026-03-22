@@ -356,6 +356,15 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t gpu_device, int32_
 // ---------------------------------------------------------------------------
 
 bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
+    if (ctx_kv_) {
+        ggml_free(ctx_kv_);
+        ctx_kv_ = nullptr;
+    }
+    if (kv_buf_) {
+        ggml_backend_buffer_free(kv_buf_);
+        kv_buf_ = nullptr;
+    }
+
     max_seq_len_ = max_seq_len;
     n_past_      = 0;
 

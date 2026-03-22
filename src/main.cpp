@@ -3,6 +3,19 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <shellapi.h>
+
+static std::string utf16_to_utf8(const std::wstring & wstr) {
+    if (wstr.empty()) return std::string();
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
+    std::string strTo(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
+    return strTo;
+}
+#endif
+
 void print_uso() {
     std::cout << "Usage: s2 [options]\n";
     std::cout << "Options:\n";
@@ -14,13 +27,34 @@ void print_uso() {
     std::cout << "  -o, --output <path>                 Output WAV path\n";
     std::cout << "  -v, -c, --vulkan, --cuda <device>   Vulkan/Cuda device index (-1 for CPU)\n";
     std::cout << "  -threads N                          Number of CPU threads for inference (default: 4)\n";
-    std::cout << "  -max-tokens N                       Max tokens to generate (default: 512, ~24s audio)\n";
+    std::cout << "  -max-tokens N                       Max tokens to generate (default: 2048, ~96s audio)\n";
     std::cout << "  -temp F                             Sampling temperature (default: 0.7)\n";
     std::cout << "  -top-p F                            Top-p sampling (default: 0.7)\n";
     std::cout << "  -top-k N                            Top-k sampling (default: 30)\n";
+    std::cout << "  --no-split-sentences                Disable sentence splitting\n";
 }
 
 int main(int argc, char ** argv) {
+#ifdef _WIN32
+    // On Windows, the command line is passed in the local code page in argv.
+    // We must use GetCommandLineW and convert to UTF-8 for proper Unicode support.
+    int argc_w;
+    LPWSTR* argv_w = CommandLineToArgvW(GetCommandLineW(), &argc_w);
+    std::vector<std::string> args_utf8;
+    std::vector<char*> argv_utf8;
+    if (argv_w) {
+        for (int i = 0; i < argc_w; ++i) {
+            args_utf8.push_back(utf16_to_utf8(argv_w[i]));
+        }
+        LocalFree(argv_w);
+        for (auto & s : args_utf8) {
+            argv_utf8.push_back(&s[0]);
+        }
+        argc = argc_w;
+        argv = argv_utf8.data();
+    }
+#endif
+
     if (argc < 2) {
         print_uso();
         return 1;
@@ -63,9 +97,26 @@ int main(int argc, char ** argv) {
             if (i + 1 < argc) params.gen.top_p = std::stof(argv[++i]);
         } else if (arg == "-top-k") {
             if (i + 1 < argc) params.gen.top_k = std::stoi(argv[++i]);
+        } else if (arg == "--no-split-sentences") {
+            params.split_sentences = false;
         } else if (arg == "-h" || arg == "--help") {
             print_uso();
             return 0;
+        }
+    }
+    
+    // Fallback: if model file doesn't exist at the given path, check in "models/" folder
+    {
+        FILE * f = std::fopen(params.model_path.c_str(), "r");
+        if (f) {
+            std::fclose(f);
+        } else {
+            // Check models/ prefix
+            std::string candidate = "models/" + params.model_path;
+            if (FILE * f2 = std::fopen(candidate.c_str(), "r")) {
+                std::fclose(f2);
+                params.model_path = candidate;
+            }
         }
     }
 

@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <random>
 
 namespace s2 {
 
@@ -19,7 +20,7 @@ struct SamplerParams {
 // to survive both top-k and top-p truncation (used to ensure EOS is always
 // reachable regardless of GPU numerical precision differences).
 int32_t sample_token(const float * logits, int32_t vocab_size, const SamplerParams & params,
-                     int32_t always_include_id = -1);
+                     std::mt19937 & gen, int32_t always_include_id = -1);
 
 // Repetition Aware Sampling (RAS):
 // Tracks a window of recent tokens, resamples with high temp if repeating.
@@ -32,6 +33,7 @@ public:
     // Sample with RAS check. sem_begin/sem_end define the semantic token range.
     int32_t sample(const float * logits, int32_t vocab_size,
                    const SamplerParams & params,
+                   std::mt19937 & gen,
                    int32_t sem_begin, int32_t sem_end);
 
     void reset();
