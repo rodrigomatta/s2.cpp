@@ -1,0 +1,149 @@
+openapi: 3.1.0
+info:
+  title: s2.cpp HTTP Server API
+  description: |
+    HTTP server for Fish Audio S2 Pro text-to-speech inference engine.
+    Provides a single endpoint for generating speech from text with optional voice cloning.
+  version: 1.0.0
+  contact:
+    name: s2.cpp project
+    url: https://github.com/fishaudio/s2.cpp
+  license:
+    name: MIT
+    url: https://github.com/fishaudio/s2.cpp/blob/main/LICENSE.md
+
+servers:
+  - url: http://127.0.0.1:3030
+    description: Default local server
+
+paths:
+  /generate:
+    post:
+      summary: Generate speech from text
+      description: |
+        Synthesize speech from given text, optionally using reference audio for voice cloning.
+        Request must be multipart/form-data.
+      operationId: generateSpeech
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - text
+              properties:
+                text:
+                  type: string
+                  description: Text to synthesize (required)
+                  example: "Hello, world!"
+                reference_text:
+                  type: string
+                  description: |
+                    Transcript of the reference audio (required if reference audio is provided).
+                    Aliases: ref_text, prompt_text.
+                  example: "This is a reference audio transcript."
+                params:
+                  type: string
+                  description: |
+                    JSON string containing generation parameters (optional).
+                    The JSON object must match the GenerateParams schema.
+                    See the GenerateParams component for field details.
+                  example: '{"temperature": 0.9, "top_p": 0.9}'
+                reference:
+                  type: string
+                  format: binary
+                  description: |
+                    Reference audio file for voice cloning (optional).
+                    Supported aliases: reference_audio, prompt_audio, ref_audio.
+                    Must be a WAV or MP3 file.
+              additionalProperties: false
+      responses:
+        '200':
+          description: Generated audio as WAV file
+          content:
+            audio/wav:
+              schema:
+                type: string
+                format: binary
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: 'attachment; filename="generated_audio.wav"'
+        '400':
+          description: Bad request (missing required field, invalid parameters, synthesis failure)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+            text/plain:
+              schema:
+                type: string
+        '500':
+          description: Internal server error (server initialization, pipeline failure)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+            text/plain:
+              schema:
+                type: string
+
+components:
+  schemas:
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Human-readable error message
+      example:
+        error: "No text field in multipart form"
+    
+    GenerateParams:
+      type: object
+      description: Generation parameters (JSON object)
+      properties:
+        max_new_tokens:
+          type: integer
+          minimum: 0
+          default: 1024
+          description: Maximum number of semantic tokens to generate
+        temperature:
+          type: number
+          format: float
+          minimum: 0.0
+          default: 0.8
+          description: Sampling temperature (higher = more random)
+        top_p:
+          type: number
+          format: float
+          minimum: 0.0
+          default: 0.8
+          description: Nucleus sampling probability
+        top_k:
+          type: integer
+          minimum: 0
+          default: 30
+          description: Top-k sampling (0 = disabled)
+        min_tokens_before_end:
+          type: integer
+          minimum: 0
+          default: 0
+          description: Minimum tokens before EOS token is allowed
+        n_threads:
+          type: integer
+          minimum: 1
+          default: 4
+          description: Number of CPU threads for generation
+        verbose:
+          type: boolean
+          default: true
+          description: Enable verbose logging
+
+tags:
+  - name: Speech
+    description: Text-to-speech generation endpoints
