@@ -5,6 +5,7 @@
 #include "s2_generate.h"
 #include "s2_model.h"
 #include "s2_tokenizer.h"
+#include "s2_voice.h"
 
 #include <cstdint>
 #include <string>
@@ -25,6 +26,11 @@ struct PipelineParams {
     bool trim_silence = false;
     bool normalize_output = false;
     bool normalize_dynamic = false;
+    
+    // Voice persistence
+    std::string voice_id;           // load saved voice profile
+    bool save_voice = false;        // save encoded voice profile after cloning
+    std::string voice_storage_dir = "./voices"; // where profiles are stored
 };
 
 class Pipeline {
@@ -42,8 +48,16 @@ private:
     Tokenizer   tokenizer_;
     SlowARModel model_;
     AudioCodec  codec_;
+    VoiceProfileManager voice_mgr_;
     mutable std::mutex synthesize_mutex_;
     bool initialized_ = false;
+    
+    // Save voice profile from encoded codes and transcript
+    bool save_voice_profile(const std::string & voice_id, 
+                           const std::vector<int32_t> & codes, 
+                           int32_t T_prompt,
+                           const std::string & transcript,
+                           const PipelineParams & params);
 };
 
 }

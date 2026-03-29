@@ -69,6 +69,93 @@ Alternatively, you can run the test suite via `ctest` after building:
 cd build && ctest --output-on-failure
 ```
 
+## Project Architecture Overview
+
+s2.cpp implements a **Dual‑Autoregressive (Dual‑AR) text‑to‑speech inference engine** for Fish Audio's S2 Pro model. It is a pure C++17 GGML‑based pipeline that runs locally with CPU, Vulkan, or CUDA backends (no Python required).
+
+### Core Pipeline
+```
+Text → Tokenizer → Prompt Builder → Slow‑AR Transformer → Fast‑AR Decoder → Audio Codec → WAV
+```
+
+### Key Components
+
+1. **Tokenizer** (`s2_tokenizer.cpp`):  
+   - BPE tokenizer reading HuggingFace `tokenizer.json` (Qwen3 with Byte‑Level pre‑tokenization).  
+   - Handles special tokens (`<|im_start|>`, `<|semantic:N|>`, `<|voice|>`, etc.).
+
+2. **Prompt Builder** (`s2_prompt.cpp`):  
+   - Constructs `(num_codebooks + 1) × T` integer tensor combining text tokens and optional reference‑audio codes for voice cloning.
+
+3. **Slow‑AR Model** (`s2_model.cpp`):  
+   - 36‑layer Qwen3‑based transformer (4.13B params) with GQA, RoPE, QK‑norm, and KV cache.  
+   - Processes semantic tokens; outputs hidden state and logits for next semantic token.  
+   - **Operations**: `load()`, `init_kv_cache()`, `prefill()`, `step()`.
+
+4. **Fast‑AR Decoder** (`s2_model.cpp`):  
+   - 4‑layer transformer (0.42B params) that takes Slow‑AR hidden state plus prefix codebook tokens.  
+   - Autoregressively predicts remaining acoustic codebook tokens (10 codebooks total).  
+   - **Operation**: `fast_decode()`.
+
+5. **Audio Codec** (`s2_codec.cpp`):  
+   - Convolutional encoder/decoder with RVQ (10 codebooks × 4096 entries).  
+   - Encodes reference audio to codes; decodes generated codes to 44.1 kHz mono waveform.  
+   - Always runs on CPU (tiny workload).
+
+6. **Generation Loop** (`s2_generate.cpp`):  
+   - Manages the autoregressive loop: prefill → while not EOS → sample semantic token → fast‑decode codebooks → store frame → step.  
+   - Implements **Repetition‑Aware Sampling (RAS)** and semantic‑mask enforcement.  
+   - Uses top‑k + top‑p + temperature sampling matching Fish‑Speech.
+
+7. **Pipeline** (`s2_pipeline.cpp`):  
+   - Top‑level orchestrator: initializes tokenizer, model, codec; handles voice‑cloning flow; applies post‑processing (normalization, silence trimming).  
+   - **HTTP server** (`s2_server.cpp`) exposes a `/generate` endpoint for remote synthesis.
+
+### Dual‑AR Design Rationale
+- **Slow‑AR**: models long‑range linguistic dependencies (one semantic token per ~21.5 ms frame).  
+- **Fast‑AR**: models local acoustic correlations (10 codebook tokens per frame).  
+- This separation drastically reduces per‑step FLOPs compared to a monolithic AR model over all codebooks.
+
+### Memory & Execution Model
+- Uses **GGML** tensors and allocators.  
+- Separate allocators for: KV‑cache (persistent), Slow‑AR compute buffer, Fast‑AR compute buffer, prefill temporary buffer.  
+- GPU backends run the transformer; codec stays on CPU.  
+- **posix_fadvise(DONTNEED)** on Linux to drop GGUF file from page cache after loading weights.
+
+### File Structure
+```
+include/                 # Headers (one per component)
+src/                     # Implementations
+├── s2_model.cpp        # Slow‑AR + Fast‑AR
+├── s2_codec.cpp        # Audio codec
+├── s2_tokenizer.cpp    # Tokenizer
+├── s2_generate.cpp     # Generation loop
+├── s2_prompt.cpp       # Prompt builder
+├── s2_pipeline.cpp     # Top‑level pipeline
+├── s2_sampler.cpp      # Sampling utilities
+├── s2_audio.cpp        # WAV I/O & audio processing
+├── s2_server.cpp       # HTTP server
+└── main.cpp            # CLI entry‑point
+```
+
+### Important Data Structures
+- `ModelHParams`: model hyper‑parameters (context length, vocab size, codebook size, etc.).  
+- `PromptTensor`: `(num_codebooks+1, T)` integer matrix for model input.  
+- `StepResult`: hidden state + logits from a Slow‑AR step.  
+- `GenerateParams`: generation settings (temperature, top‑p, top‑k, max tokens, etc.).  
+
+### Voice‑Cloning Flow
+1. Load reference audio (WAV/MP3) → encode to codes via codec.  
+2. Build prompt: `<|im_start|> <|voice|> transcript <|im_end|> reference‑codes <|im_start|> text <|im_end|>`.  
+3. Model learns speaker’s voice from reference codes and transcript.  
+4. **Voice profile persistence** (optional): encoded codes + transcript can be saved to a `.s2voice` binary file and reused later via `--voice <id>`. Profiles are stored in `./voices/` and checked for compatibility (codebook size, sample rate, num_codebooks).
+
+### When Modifying
+- The **GGUF file** contains both transformer weights and codec tensors (`c.*` prefix).  
+- Adding new source files requires updating `CMakeLists.txt` `S2_SOURCES`.  
+- Follow existing patterns for error handling (`bool` returns, `std::runtime_error` for fatal errors).  
+- Use GPU backend guards (`#ifdef GGML_USE_VULKAN`, `GGML_USE_CUDA`).
+
 ## Code Style Guidelines
 
 ### Language Standard

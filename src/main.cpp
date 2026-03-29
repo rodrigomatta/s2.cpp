@@ -16,12 +16,12 @@ namespace fs = ghc::filesystem;
 #include <clocale>
 #endif
 
-static void safe_print(const char* msg) {
-    fputs(msg, stdout);
+static void safe_print(const std::string& msg) {
+    fputs(msg.c_str(), stdout);
 }
 
-static void safe_print_error(const char* msg) {
-    fputs(msg, stderr);
+static void safe_print_error(const std::string& msg) {
+    fputs(msg.c_str(), stderr);
 }
 
 void print_uso() {
@@ -32,6 +32,10 @@ void print_uso() {
     safe_print("  -text              <text>   Text to synthesize\n");
     safe_print("  -pa, --prompt-audio <path>  Path to reference audio for cloning\n");
     safe_print("  -pt, --prompt-text <text>   Text of the reference audio\n");
+    safe_print("  --voice            <id>     Use saved voice profile (instead of -pa/-pt)\n");
+    safe_print("  --save-voice                Save encoded voice profile after cloning (requires --voice)\n");
+    safe_print("  --voice-dir        <path>   Directory for voice profiles (default: ./voices)\n");
+    safe_print("  --list-voices               List saved voice profiles\n");
     safe_print("  -o, --output       <path>   Output WAV path\n");
     safe_print("  -v, -c, --vulkan, --cuda <id>   Vulkan/Cuda device index (-1 = CPU)\n");
     safe_print("  -threads           <n>      Number of threads\n");
@@ -101,6 +105,7 @@ int main(int argc, char** argv) {
     params.backend_type = -1;
 
     bool use_server = false;
+    bool list_voices = false;
     s2::ServerParams serverParams;
 
     for (int i = 1; i < argc; ++i) {
@@ -110,6 +115,10 @@ int main(int argc, char** argv) {
         else if (arg == "-text")                          { if (i+1 < argc) params.text               = argv[++i]; }
         else if (arg == "-pa" || arg == "--prompt-audio") { if (i+1 < argc) params.prompt_audio_path = argv[++i]; }
         else if (arg == "-pt" || arg == "--prompt-text")  { if (i+1 < argc) params.prompt_text        = argv[++i]; }
+        else if (arg == "--voice")                        { if (i+1 < argc) params.voice_id           = argv[++i]; }
+        else if (arg == "--save-voice")                   { params.save_voice = true; }
+        else if (arg == "--voice-dir")                    { if (i+1 < argc) params.voice_storage_dir  = argv[++i]; }
+        else if (arg == "--list-voices")                  { list_voices = true; }
         else if (arg == "-o"  || arg == "--output")       { if (i+1 < argc) params.output_path        = argv[++i]; }
         else if (arg == "-v"  || arg == "--vulkan")       { if (i+1 < argc) { try { params.gpu_device = std::stoi(argv[++i]); } catch(...) {} params.backend_type = 0; } }
         else if (arg == "-c"  || arg == "--cuda")         { if (i+1 < argc) { try { params.gpu_device = std::stoi(argv[++i]); } catch(...) {} params.backend_type = 1; } }
@@ -136,6 +145,41 @@ int main(int argc, char** argv) {
         else if (arg == "-H" || arg == "--host") { if (i+1 < argc) serverParams.host = argv[++i]; }
         else if (arg == "-P" || arg == "--port") { if (i+1 < argc) { try { serverParams.port = std::stoi(argv[++i]); } catch(...) {} } }
         else if (arg == "-h" || arg == "--help") { print_uso(); return 0; }
+    }
+
+    if (list_voices) {
+        fs::path dir(params.voice_storage_dir);
+        if (fs::exists(dir)) {
+            safe_print("Saved voice profiles:\n");
+            for (const auto & entry : fs::directory_iterator(dir)) {
+                if (entry.path().extension() == ".s2voice") {
+                    safe_print("  " + entry.path().stem().string() + "\n");
+                }
+            }
+        } else {
+            safe_print("No voice profiles directory found.\n");
+        }
+        return 0;
+    }
+
+    // Validate voice profile options
+    if (!params.voice_id.empty()) {
+        if (!params.prompt_audio_path.empty()) {
+            safe_print_error("Warning: --voice overrides -pa/--prompt-audio, reference audio will be ignored.\n");
+        }
+        if (!params.prompt_text.empty()) {
+            safe_print_error("Warning: --voice overrides -pt/--prompt-text, prompt text will be ignored.\n");
+        }
+    }
+    if (params.save_voice) {
+        if (params.voice_id.empty()) {
+            safe_print_error("Error: --save-voice requires --voice <id>.\n");
+            return 1;
+        }
+        if (params.prompt_audio_path.empty() || params.prompt_text.empty()) {
+            safe_print_error("Error: --save-voice requires -pa/--prompt-audio and -pt/--prompt-text.\n");
+            return 1;
+        }
     }
 
     if (params.tokenizer_path == "tokenizer.json") {

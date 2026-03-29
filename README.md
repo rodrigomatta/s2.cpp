@@ -133,6 +133,40 @@ Provide a short reference clip (5–30 seconds, WAV or MP3) and a transcript of 
 
 By default, the engine uses fish-speech-aligned sampling defaults: `--min-tokens-before-end 0`, no trailing-silence trim, no peak normalization, and no dynamic loudness normalization. All of these behaviors are optional and can be enabled from the CLI.
 
+### Voice profile persistence
+
+Encoded voice profiles can be saved and reused, eliminating the need to re‑encode the reference audio and transcript each time.
+
+**Save a voice profile** (clones voice and saves profile):
+```bash
+./build/s2 \
+  -m s2-pro-q6_k.gguf \
+  -t tokenizer.json \
+  -pa reference.wav \
+  -pt "Transcript of what the reference speaker says." \
+  --voice alice \
+  --save-voice \
+  -text "Now synthesize this text in that voice." \
+  -o output.wav
+```
+
+**Reuse a saved voice profile** (no reference audio needed):
+```bash
+./build/s2 \
+  -m s2-pro-q6_k.gguf \
+  -t tokenizer.json \
+  --voice alice \
+  -text "Another sentence in the same voice." \
+  -o output.wav
+```
+
+**List saved profiles:**
+```bash
+./build/s2 --list-voices
+```
+
+Profiles are stored as `.s2voice` binary files in `./voices` (customizable with `--voice-dir`). They contain the encoded reference codes, transcript, and metadata (codebook size, sample rate, etc.). The format is **little‑endian** and portable across Windows, Linux, and macOS on x86/ARM.
+
 ### GPU inference via Vulkan (AMD/Intel)
 
 ```bash
@@ -168,6 +202,10 @@ By default, the engine uses fish-speech-aligned sampling defaults: `--min-tokens
 | `-text` | `"Hello world"` | Text to synthesize |
 | `-pa`, `--prompt-audio` | — | Reference audio file for voice cloning (WAV/MP3) |
 | `-pt`, `--prompt-text` | — | Transcript of the reference audio |
+| `--voice` | — | Use saved voice profile (instead of -pa/-pt) |
+| `--save-voice` | `false` | Save encoded voice profile after cloning (requires --voice and -pa/-pt) |
+| `--voice-dir` | `"./voices"` | Directory for voice profiles |
+| `--list-voices` | — | List saved voice profiles and exit |
 | `-o`, `--output` | `out.wav` | Output WAV file path |
 | `-v`, `--vulkan` | `-1` (CPU) | Vulkan device index (`-1` = CPU only) |
 | `-c`, `--cuda` | `-1` (CPU) | CUDA device index (`-1` = CPU only) |

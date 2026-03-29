@@ -149,18 +149,50 @@ bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_aud
 
     std::vector<int32_t> ref_codes;
     int32_t T_prompt = 0;
-
+    std::string effective_prompt_text = params.prompt_text;
+    
+    // Set voice storage directory
+    voice_mgr_.set_storage_dir(params.voice_storage_dir);
+    
+    // 1. Encode reference audio if provided (takes precedence over voice_id)
     if (!ref_audio.samples.empty()) {
+        safe_print_ln("Encoding reference audio...");
         if (!codec_.encode(ref_audio.samples.data(), (int32_t)ref_audio.samples.size(),
                            params.gen.n_threads, ref_codes, T_prompt)) {
             safe_print_error_ln("Pipeline warning: encode failed, running without reference audio.");
             ref_codes.clear();
             T_prompt = 0;
+        } else {
+            safe_print_ln("Encoded reference audio: " + std::to_string(T_prompt) + " frames");
+            // Save voice profile if requested
+            if (params.save_voice && !params.voice_id.empty()) {
+                if (!save_voice_profile(params.voice_id, ref_codes, T_prompt, effective_prompt_text, params)) {
+                    safe_print_error_ln("Warning: failed to save voice profile.");
+                }
+            }
+        }
+    }
+    // 2. Otherwise load existing voice profile if voice_id is provided
+    else if (!params.voice_id.empty()) {
+        safe_print_ln("Loading voice profile: " + params.voice_id);
+        try {
+            VoiceProfile profile = voice_mgr_.load(params.voice_id);
+            if (!profile.is_compatible(num_codebooks, model_.hparams().codebook_size, codec_.sample_rate())) {
+                safe_print_error_ln("Voice profile incompatible with current model/codec.");
+                return false;
+            }
+            ref_codes = profile.codes;
+            T_prompt = profile.T_prompt;
+            effective_prompt_text = profile.transcript;
+            safe_print_ln("Loaded voice profile: " + params.voice_id + " (" + std::to_string(T_prompt) + " frames)");
+        } catch (const std::exception & e) {
+            safe_print_error_ln("Failed to load voice profile " + params.voice_id + ": " + e.what());
+            return false;
         }
     }
 
     PromptTensor prompt = build_prompt(
-        tokenizer_, params.text, params.prompt_text,
+        tokenizer_, params.text, effective_prompt_text,
         ref_codes.empty() ? nullptr : ref_codes.data(),
         num_codebooks, T_prompt);
 
@@ -184,6 +216,38 @@ bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_aud
 
     model_.clear_kv_cache();
     return true;
+}
+
+bool Pipeline::save_voice_profile(const std::string & voice_id, 
+                                 const std::vector<int32_t> & codes, 
+                                 int32_t T_prompt,
+                                 const std::string & transcript,
+                                 const PipelineParams & params) {
+    if (voice_id.empty()) return false;
+    
+    voice_mgr_.set_storage_dir(params.voice_storage_dir);
+    
+    VoiceProfile profile;
+    profile.transcript = transcript;
+    profile.codes = codes;
+    profile.num_codebooks = model_.hparams().num_codebooks;
+    profile.T_prompt = T_prompt;
+    profile.sample_rate = codec_.sample_rate();
+    profile.codebook_size = model_.hparams().codebook_size;
+    
+    // Simple timestamp
+    std::time_t now = std::time(nullptr);
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+    profile.timestamp = buf;
+    
+    if (voice_mgr_.save(voice_id, profile)) {
+        safe_print_ln("Saved voice profile: " + voice_id);
+        return true;
+    } else {
+        safe_print_error_ln("Failed to save voice profile: " + voice_id);
+        return false;
+    }
 }
 
 }

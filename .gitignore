@@ -8,3 +8,6 @@ build/
 *.d
 compile_commands.json
 .cache/
+ref_audio.*
+ref_text.*
+/voices
