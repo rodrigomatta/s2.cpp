@@ -1,0 +1,428 @@
+openapi: 3.1.0
+info:
+  title: s2.cpp HTTP Server API
+  version: 0.1.0
+  description: |
+    OpenAPI description for the built-in `s2 --server` mode.
+
+    The server exposes a single multipart endpoint for text-to-speech synthesis
+    with optional reference-audio voice cloning.
+
+    By default the response is a finalized `audio/wav` download. When the
+    request enables the streaming synthesis path (`params.stream=true`), the
+    server still returns a finalized WAV unless the client also opts into
+    real-time chunked transport with `params.chunked=true` (or the alias
+    `params.realtime=true`). That live transport uses a provisional WAV header
+    because the server cannot seek back over an open HTTP stream.
+
+    The server accepts one active synthesis at a time. If another request
+    arrives while generation is already in progress, it returns HTTP `503`.
+  license:
+    name: Fish Audio Research License
+    url: https://github.com/fishaudio/s2.cpp/blob/main/LICENSE.md
+
+servers:
+  - url: http://127.0.0.1:3030
+    description: Default local server
+
+tags:
+  - name: Speech
+    description: Text-to-speech synthesis
+
+paths:
+  /generate:
+    post:
+      tags:
+        - Speech
+      operationId: generateSpeech
+      summary: Generate speech from text
+      description: |
+        Accepts `multipart/form-data` with the target text plus optional
+        reference audio for voice cloning.
+
+        Canonical multipart fields are `text`, `reference`, `reference_text`,
+        `voice`, `voice_dir`, and `params`.
+
+        Accepted aliases:
+        - `reference`: `reference_audio`, `prompt_audio`, `ref_audio`
+        - `reference_text`: `ref_text`, `prompt_text`
+        - `voice`: `voice_id`, `voice_profile`
+
+        If synthesis completes successfully, the response body is returned as
+        `audio/wav`. When `params.stream=true` and `params.chunked=true`, the
+        body is sent with real-time chunked transfer and may be interrupted if
+        generation fails after the stream begins. Chunked responses begin with
+        a provisional WAV header instead of a finalized RIFF/data size.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - text
+              allOf:
+                - if:
+                    anyOf:
+                      - required: [reference]
+                      - required: [reference_audio]
+                      - required: [prompt_audio]
+                      - required: [ref_audio]
+                  then:
+                    anyOf:
+                      - required: [reference_text]
+                      - required: [ref_text]
+                      - required: [prompt_text]
+              properties:
+                text:
+                  type: string
+                  description: Text to synthesize.
+                  examples:
+                    - Hello, world.
+                reference:
+                  type: string
+                  format: binary
+                  description: |
+                    Optional reference audio file for voice cloning.
+                    Supported aliases: `reference_audio`, `prompt_audio`,
+                    `ref_audio`.
+                reference_audio:
+                  type: string
+                  format: binary
+                  deprecated: true
+                  description: Alias for `reference`.
+                prompt_audio:
+                  type: string
+                  format: binary
+                  deprecated: true
+                  description: Alias for `reference`.
+                ref_audio:
+                  type: string
+                  format: binary
+                  deprecated: true
+                  description: Alias for `reference`.
+                reference_text:
+                  type: string
+                  description: |
+                    Transcript for the reference audio. Required whenever a
+                    reference audio file is provided.
+
+                    Supported aliases: `ref_text`, `prompt_text`.
+                  examples:
+                    - This is a short sample of the reference speaker.
+                ref_text:
+                  type: string
+                  deprecated: true
+                  description: Alias for `reference_text`.
+                prompt_text:
+                  type: string
+                  deprecated: true
+                  description: Alias for `reference_text`.
+                voice:
+                  type: string
+                  description: |
+                    Saved voice profile id such as `hope`, or a `.s2voice`
+                    path such as `voices/hope.s2voice`.
+
+                    Supported aliases: `voice_id`, `voice_profile`.
+                  examples:
+                    - hope
+                voice_id:
+                  type: string
+                  deprecated: true
+                  description: Alias for `voice`.
+                voice_profile:
+                  type: string
+                  deprecated: true
+                  description: Alias for `voice`.
+                voice_dir:
+                  type: string
+                  description: |
+                    Directory used when `voice` is passed as an id instead of a
+                    full `.s2voice` path.
+                  examples:
+                    - ./voices
+                params:
+                  type: string
+                  description: |
+                    Optional JSON string with generation overrides. Supported
+                    keys are described by `GenerateParams`.
+                  contentMediaType: application/json
+                  contentSchema:
+                    $ref: '#/components/schemas/GenerateParams'
+                  examples:
+                    - '{"temperature":0.9,"top_p":0.9,"max_new_tokens":512}'
+      responses:
+        '200':
+          description: |
+            Audio response with a `Content-Disposition` download header.
+            The default payload is WAV. Real-time chunked transport is used
+            only when `params.stream=true` and `params.chunked=true`; in WAV
+            mode the header remains provisional because the server cannot seek
+            back over the live response. `params.output_format="pcm_s16le"`
+            instead returns raw mono PCM16 bytes. The runtime `Content-Type`
+            includes `rate` and `channels` parameters derived from the loaded
+            codec, and the same values are also exposed via `X-Audio-*`
+            headers.
+          headers:
+            Content-Disposition:
+              description: Suggested download filename.
+              schema:
+                type: string
+                example: attachment; filename="generated_audio.wav"
+            X-Audio-Sample-Rate:
+              description: Present for `pcm_s16le` responses.
+              schema:
+                type: integer
+            X-Audio-Channels:
+              description: Present for `pcm_s16le` responses.
+              schema:
+                type: integer
+            X-Audio-Encoding:
+              description: Present for `pcm_s16le` responses.
+              schema:
+                type: string
+          content:
+            audio/wav:
+              schema:
+                type: string
+                format: binary
+            audio/L16:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: |
+            Invalid request. The server may return either JSON errors for form
+            parsing/JSON validation failures or plain text for validation
+            errors.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                missingText:
+                  value:
+                    error: No text field in multipart form
+                badParamsJson:
+                  value:
+                    error: JSON parse error
+                invalidParamsType:
+                  value:
+                    error: "Invalid params JSON: [json.exception.type_error.302] type must be number, but is string"
+            text/plain:
+              schema:
+                type: string
+              examples:
+                missingReferenceText:
+                  value: "Reference audio requires reference_text (aliases: ref_text, prompt_text)."
+        '500':
+          description: Synthesis failed after request validation and before the response body started.
+          content:
+            text/plain:
+              schema:
+                type: string
+              examples:
+                synthesisFailed:
+                  value: Synthesis failed.
+        '503':
+          description: Another synthesis request is already running.
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: Server busy processing another synthesis request.
+
+components:
+  schemas:
+    Error:
+      type: object
+      additionalProperties: false
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
+
+    GenerateParams:
+      type: object
+      description: |
+        JSON object accepted inside the multipart `params` field. Any omitted
+        value falls back to the server's startup defaults. Unknown keys are
+        currently ignored by the server for forward compatibility.
+      allOf:
+        - if:
+            properties:
+              chunked:
+                const: true
+          then:
+            required: [stream]
+            properties:
+              stream:
+                const: true
+        - if:
+            properties:
+              realtime:
+                const: true
+          then:
+            required: [stream]
+            properties:
+              stream:
+                const: true
+      properties:
+        max_new_tokens:
+          type: integer
+          minimum: 0
+          description: Maximum number of semantic tokens to generate.
+          default: 1024
+        temperature:
+          type: number
+          format: float
+          minimum: 0
+          description: Sampling temperature.
+          default: 0.8
+        top_p:
+          type: number
+          format: float
+          minimum: 0
+          description: Top-p nucleus sampling threshold.
+          default: 0.8
+        top_k:
+          type: integer
+          minimum: 0
+          description: Top-k sampling limit.
+          default: 30
+        min_tokens_before_end:
+          type: integer
+          minimum: 0
+          description: Minimum generated tokens before EOS is allowed.
+          default: 0
+        n_threads:
+          type: integer
+          minimum: 1
+          description: Number of CPU threads to use for generation.
+        codec_follow_backend:
+          type: boolean
+          description: |
+            When true, lets the codec follow the selected GPU backend when
+            possible; otherwise keeps the codec on CPU. If codec GPU
+            initialization or allocation fails, the runtime falls back to CPU.
+          default: true
+        codec_auto_backend:
+          type: boolean
+          description: |
+            When true, lets the runtime benchmark/select the codec backend
+            automatically. When false, `codec_follow_backend` is applied
+            directly.
+          default: true
+        voice:
+          type: string
+          description: |
+            Saved voice profile id such as `hope`, or a `.s2voice` path such as
+            `voices/hope.s2voice`.
+        voice_id:
+          type: string
+          description: Alias for `voice`.
+        voice_dir:
+          type: string
+          description: |
+            Directory used when `voice` is passed as an id instead of a full
+            `.s2voice` path.
+        stream:
+          type: boolean
+          description: |
+            Use the streaming synthesis path instead of the one-shot final
+            decode path. The HTTP response is still a finalized WAV unless
+            `chunked` (or alias `realtime`) is also enabled.
+          default: false
+        chunked:
+          type: boolean
+          description: |
+            When used together with `stream=true`, keeps the original real-time
+            chunked PCM16 WAV transport instead of waiting to finalize the WAV
+            before sending it. The live response starts with a provisional WAV
+            header because the final RIFF/data sizes are not known up front.
+          default: false
+        realtime:
+          type: boolean
+          description: Alias for `chunked`.
+        stream_decode_stride_frames:
+          type: integer
+          minimum: 0
+          description: |
+            Streaming decode cadence in frames. `0` keeps the server auto
+            cadence, currently `4` frames.
+          default: 0
+        stream_decode_stride:
+          type: integer
+          minimum: 0
+          description: Alias for `stream_decode_stride_frames`.
+        stream_holdback_frames:
+          type: integer
+          minimum: 0
+          description: |
+            Trailing codec frames to keep buffered before emitting audio during
+            streaming. Lower values reduce startup latency; `0` is the most
+            aggressive live mode. When omitted, the runtime uses the codec's
+            full history window for maximum stability.
+        codec_decode_context_frames:
+          type: integer
+          minimum: 0
+          description: |
+            Codec decode history window. Lower values reduce memory use but may
+            reduce continuity quality while streaming.
+        codec_context_frames:
+          type: integer
+          minimum: 0
+          deprecated: true
+          description: Alias for `codec_decode_context_frames`.
+        stream_start_buffer_ms:
+          type: integer
+          minimum: 0
+          description: |
+            For chunked HTTP streaming, delay the first response bytes until
+            approximately this much PCM audio has been queued server-side.
+            Useful when a client prefers smoother playback over immediate
+            startup.
+        segment_sentences:
+          type: boolean
+          description: |
+            Synthesize sentence by sentence instead of using the exact
+            frame-level streaming path. This is more robust on slower machines
+            because each sentence is fully rendered before it is queued for
+            playback.
+          default: false
+        sentence_pause_ms:
+          type: integer
+          minimum: 0
+          description: |
+            Fixed silence gap inserted between sentence segments when
+            `segment_sentences=true`.
+          default: 180
+        segment_max_chars:
+          type: integer
+          minimum: 0
+          description: |
+            Optional maximum text length per synthesized segment. Long
+            sentences may be split into smaller clauses when this is set.
+        low_latency:
+          type: boolean
+          description: |
+            Convenience preset for live playback. When enabled, defaults to
+            `stream_decode_stride_frames=1` and `stream_holdback_frames=0`
+            unless those fields were already provided explicitly.
+          default: false
+        output_format:
+          type: string
+          enum: [wav, pcm_s16le]
+          description: |
+            Streaming response container. `wav` keeps the provisional/finalized
+            WAV behavior. `pcm_s16le` skips the WAV header and returns raw mono
+            PCM16 bytes, which is easier for clients that maintain a dynamic
+            playback buffer.
+          default: wav
+        verbose:
+          type: boolean
+          description: Enables verbose generation logging.
+          default: true

@@ -1,10 +1,6 @@
 #pragma once
-// s2_model.h — Slow-AR + Fast-AR model (Dual-AR Qwen3 transformer)
-//
-// Loads the Dual-AR portion from a unified GGUF file and provides
-// prefill / step / fast decode operations with KV cache.
-// Direct port from ggml/examples/fish-speech-slow-ar/main.cpp
 
+#include "s2_backend.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -16,9 +12,13 @@
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
+#endif
 
 #include <cstdint>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace s2 {
@@ -53,7 +53,6 @@ struct ModelHParams {
     bool    attention_qk_norm  = false;
     bool    scale_codebook_embeddings = false;
 
-    // Fast decoder
     int32_t fast_context_length     = 0;
     int32_t fast_embedding_length   = 0;
     int32_t fast_feed_forward_length = 0;
@@ -70,7 +69,8 @@ struct ModelHParams {
 
 struct ModelWeights {
     ggml_context * ctx_w = nullptr;
-    ggml_backend_buffer_t model_buf = nullptr;
+    std::vector<ggml_backend_buffer_t> model_bufs_cpu;
+    std::vector<ggml_backend_buffer_t> model_bufs_gpu;
 
     ggml_tensor * embeddings           = nullptr;
     ggml_tensor * codebook_embeddings  = nullptr;
@@ -85,8 +85,8 @@ struct ModelWeights {
 };
 
 struct StepResult {
-    std::vector<float> hidden;   // (embedding_length,) last-token hidden state
-    std::vector<float> logits;   // (vocab_size,) logits
+    std::vector<float> hidden;
+    std::vector<float> logits;
 };
 
 class SlowARModel {
@@ -94,26 +94,27 @@ public:
     SlowARModel();
     ~SlowARModel();
 
-    // Load model from GGUF. gpu_device=-1 means CPU only.
-    bool load(const std::string & gguf_path, int32_t gpu_device = -1, int32_t backend_type = -1);
+    bool load(const std::string & gguf_path, int32_t gpu_device = -1, BackendType backend_type = BackendType::CPU, int32_t n_gpu_layers = -1);
 
-    // Initialize KV cache for generation
+    bool load_shared(gguf_context * gguf_ctx, const std::string & gguf_path, int32_t gpu_device = -1, BackendType backend_type = BackendType::CPU, int32_t n_gpu_layers = -1);
+
+    bool read_tensor_data(const std::string & gguf_path, gguf_context * gguf_ctx);
+
+    ggml_context * weights_ctx() { return weights_.ctx_w; }
+    const std::unordered_set<ggml_tensor *> & weight_tensor_set() const { return weight_tensor_set_; }
+
     bool init_kv_cache(int32_t max_seq_len);
 
-    // Reset KV cache (for new generation)
     void reset();
 
     void clear_kv_cache();
 
-    // Prefill: process prompt tokens. flat_tokens: (num_codebooks+1)*n_tokens
     bool prefill(const std::vector<int32_t> & flat_tokens, int32_t n_tokens,
                  int32_t n_threads, StepResult & result);
 
-    // Step: process a single timestep. flat_tokens: (num_codebooks+1)
     bool step(const std::vector<int32_t> & flat_tokens, int32_t n_threads,
               StepResult & result);
 
-    // Fast decoder: generate next codebook logits given hidden state and prefix codes
     bool fast_decode(const std::vector<float> & hidden,
                      const std::vector<int32_t> & prefix_codes,
                      int32_t n_threads,
@@ -124,19 +125,27 @@ public:
 private:
     ModelHParams   hparams_;
     ModelWeights   weights_;
-    ggml_backend_t backend_      = nullptr;
-    ggml_gallocr_t allocr_       = nullptr;
-    ggml_gallocr_t fast_allocr_  = nullptr;
+    ggml_backend_t backend_cpu_  = nullptr;
+    ggml_backend_t backend_gpu_  = nullptr;
+    ggml_backend_sched_t sched_       = nullptr;
+    ggml_backend_sched_t fast_sched_  = nullptr;
     ggml_context * ctx_kv_      = nullptr;
     ggml_backend_buffer_t kv_buf_ = nullptr;
     ggml_tensor *  memory_k_   = nullptr;
     ggml_tensor *  memory_v_   = nullptr;
     int32_t        max_seq_len_ = 0;
+    int32_t        n_gpu_layers_ = -1;
     int32_t        n_past_     = 0;
+    size_t         ctx_size_   = 0;
+    std::vector<uint8_t> ctx_buf_;
+    size_t         fast_ctx_size_ = 0;
+    std::vector<uint8_t> fast_ctx_buf_;
+
+    std::unordered_set<ggml_tensor *> weight_tensor_set_;
 
     bool eval_cached(const std::vector<int32_t> & flat_tokens,
                      int32_t n_tokens, int32_t n_threads,
                      StepResult & result);
 };
 
-} // namespace s2
+}

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 #define DR_WAV_IMPLEMENTATION
 #include "../third_party/dr_wav.h"
@@ -187,6 +188,63 @@ void audio_free_memory_wav(void** wav_buffer, size_t* wav_size, const drwav_allo
     drwav_free(*wav_buffer, pAllocationCallbacks);
     *wav_buffer = nullptr;
     *wav_size = 0;
+}
+
+bool audio_write_streaming_wav_header(uint8_t* out, int32_t sample_rate,
+                                       int32_t channels, int32_t bits_per_sample) {
+    if (!out) return false;
+
+    const uint32_t byte_rate   = static_cast<uint32_t>(sample_rate) * channels * (bits_per_sample / 8);
+    const uint16_t block_align = static_cast<uint16_t>(channels * (bits_per_sample / 8));
+    const uint16_t audio_format = bits_per_sample == 32 ? 3 : 1;
+
+    size_t offset = 0;
+    auto write_u32 = [&](uint32_t v) {
+        std::memcpy(out + offset, &v, 4); offset += 4;
+    };
+    auto write_u16 = [&](uint16_t v) {
+        std::memcpy(out + offset, &v, 2); offset += 2;
+    };
+    auto write_str = [&](const char* s, size_t n) {
+        std::memcpy(out + offset, s, n); offset += n;
+    };
+
+    constexpr uint32_t kStreamingPlaceholderChunkSize = 0x7FFFFFF0u;
+    write_str("RIFF", 4);
+    write_u32(kStreamingPlaceholderChunkSize);
+    write_str("WAVE", 4);
+
+    write_str("fmt ", 4);
+    write_u32(16);
+    write_u16(audio_format);
+    write_u16(static_cast<uint16_t>(channels));
+    write_u32(static_cast<uint32_t>(sample_rate));
+    write_u32(byte_rate);
+    write_u16(block_align);
+    write_u16(static_cast<uint16_t>(bits_per_sample));
+
+    write_str("data", 4);
+    write_u32(kStreamingPlaceholderChunkSize);
+
+    assert(offset == 44);
+
+    return true;
+}
+
+std::vector<int16_t> audio_to_pcm16(const float * data, size_t n_samples) {
+    std::vector<int16_t> pcm16;
+    pcm16.resize(n_samples);
+
+    for (size_t i = 0; i < n_samples; ++i) {
+        const float s = std::clamp(data[i], -1.0f, 1.0f);
+        if (s >= 1.0f) {
+            pcm16[i] = std::numeric_limits<int16_t>::max();
+        } else {
+            pcm16[i] = static_cast<int16_t>(s * 32768.0f);
+        }
+    }
+
+    return pcm16;
 }
 
 std::vector<float> audio_resample(const float * data, size_t n_samples, int32_t src_rate, int32_t dst_rate) {

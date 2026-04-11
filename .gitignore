@@ -1,4 +1,6 @@
 build/
+bin/
+obj/
 *.gguf
 *.wav
 *.mp3
@@ -8,3 +10,9 @@ build/
 *.d
 compile_commands.json
 .cache/
+.claude/
+.qwen/
+.codex
+ref_audio.*
+ref_text.*
+/voices

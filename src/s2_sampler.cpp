@@ -98,40 +98,4 @@ int32_t sample_token(const float * logits, int32_t vocab_size, const SamplerPara
     return filtered[sampled_idx].second;
 }
 
-RASSampler::RASSampler(int32_t window_size, float high_temp, float high_top_p)
-    : window_size_(window_size), high_temp_(high_temp), high_top_p_(high_top_p) 
-{
-}
-
-int32_t RASSampler::sample(const float * logits, int32_t vocab_size,
-               const SamplerParams & params,
-               int32_t sem_begin, int32_t sem_end) {
-    
-    int32_t token = sample_token(logits, vocab_size, params);
-    
-    if (!window_.empty() && token >= sem_begin && token < sem_end) {
-        if (std::find(window_.begin(), window_.end(), token) != window_.end()) {
-            SamplerParams high_params = params;
-            high_params.temperature = high_temp_;
-            high_params.top_p = high_top_p_;
-            token = sample_token(logits, vocab_size, high_params);
-        }
-    }
-    
-    if (token >= sem_begin && token < sem_end) {
-        window_.push_back(token);
-        if ((int32_t)window_.size() > window_size_) {
-            window_.erase(window_.begin());
-        }
-    } else {
-        window_.clear();
-    }
-    
-    return token;
-}
-
-void RASSampler::reset() {
-    window_.clear();
-}
-
 }

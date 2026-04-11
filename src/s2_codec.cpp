@@ -1,11 +1,14 @@
 #include "../include/s2_codec.h"
+#include "../include/s2_log.h"
+#include "s2_ggml_utils.h"
 #ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
-#elif defined GGML_USE_CUDA
-#include "ggml-cuda.h"
 #endif
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
+#endif
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
 #endif
 #include <iostream>
 #include <vector>
@@ -19,10 +22,6 @@
 
 namespace s2 {
 
-// ---------------------------------------------------------------------------
-// Internal structures
-// ---------------------------------------------------------------------------
-
 struct vq_cache {
     int32_t input_dim    = 0;
     int32_t codebook_dim = 0;
@@ -33,7 +32,7 @@ struct vq_cache {
     std::vector<float> out_proj_weight;
     std::vector<float> out_proj_bias;
     std::vector<float> codebook;
-    std::vector<float> codebook_norm;  // L2-normalised codebook entries
+    std::vector<float> codebook_norm;
 };
 
 struct transformer_inputs {
@@ -67,14 +66,12 @@ struct AudioCodec::Impl {
     int32_t quantizer_semantic_codebook_size = 0;
     std::vector<int32_t> quantizer_downsample_factor;
 
-    // Encoder transformer params
     int32_t transformer_block_size   = 0;
     int32_t transformer_n_local_heads = 0;
     int32_t transformer_head_dim     = 0;
     float   transformer_rope_base    = 10000.0f;
     float   transformer_norm_eps     = 1e-5f;
 
-    // RVQ transformer params
     int32_t rvq_transformer_window_size   = 0;
     int32_t rvq_transformer_block_size    = 0;
     int32_t rvq_transformer_n_layer       = 0;
@@ -88,51 +85,55 @@ struct AudioCodec::Impl {
     std::vector<vq_cache> residual_vq;
 };
 
-// ---------------------------------------------------------------------------
-// Static helpers (graph builders)
-// ---------------------------------------------------------------------------
-
-static ggml_tensor * repeat_checked(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b,
-                                    const char * label = "repeat") {
-    if (!ggml_can_repeat(a, b)) {
-        std::fprintf(stderr, "%s a=(%lld,%lld,%lld,%lld) b=(%lld,%lld,%lld,%lld)\n",
-            label,
-            (long long)a->ne[0],(long long)a->ne[1],(long long)a->ne[2],(long long)a->ne[3],
-            (long long)b->ne[0],(long long)b->ne[1],(long long)b->ne[2],(long long)b->ne[3]);
+static const char * backend_type_name(BackendType backend_type) {
+    switch (backend_type) {
+        case BackendType::CPU:    return "CPU";
+        case BackendType::Vulkan: return "Vulkan";
+        case BackendType::CUDA:   return "CUDA";
+        case BackendType::Metal:  return "Metal";
     }
-    return ggml_repeat(ctx, a, b);
+    return "Unknown";
 }
 
-static ggml_tensor * mul_mat_checked(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b,
-                                     const char * label = "mul_mat") {
-    const bool can = a->ne[0]==b->ne[0] && (b->ne[2]%a->ne[2]==0) && (b->ne[3]%a->ne[3]==0);
-    if (!can || ggml_is_transposed(a)) {
-        std::fprintf(stderr, "%s transposed=%d a=(%lld,%lld,%lld,%lld) b=(%lld,%lld,%lld,%lld)\n",
-            label, ggml_is_transposed(a)?1:0,
-            (long long)a->ne[0],(long long)a->ne[1],(long long)a->ne[2],(long long)a->ne[3],
-            (long long)b->ne[0],(long long)b->ne[1],(long long)b->ne[2],(long long)b->ne[3]);
+static void reset_codec_impl(AudioCodec::Impl & impl) {
+    if (impl.model_buf) {
+        ggml_backend_buffer_free(impl.model_buf);
+        impl.model_buf = nullptr;
     }
-    return ggml_mul_mat(ctx, a, b);
+    if (impl.ctx_w) {
+        ggml_free(impl.ctx_w);
+        impl.ctx_w = nullptr;
+    }
+    if (impl.backend) {
+        ggml_backend_free(impl.backend);
+        impl.backend = nullptr;
+    }
+    impl = AudioCodec::Impl();
 }
 
-// Reshape a 1D weight tensor (channels,) to (channels, 1) for broadcasting (CL layout)
+static bool backend_requires_explicit_causal_mask(ggml_backend_t backend) {
+#ifdef GGML_USE_METAL
+    return backend != nullptr && ggml_backend_is_metal(backend);
+#else
+    (void) backend;
+    return false;
+#endif
+}
+
 static ggml_tensor * reshape_vector_cl(ggml_context * ctx, ggml_tensor * t, int64_t channels) {
     ggml_tensor * cur = (t->type == GGML_TYPE_F32) ? t : ggml_cast(ctx, t, GGML_TYPE_F32);
     return ggml_reshape_2d(ctx, cur, channels, 1);
 }
 
-// Reshape a 1D weight tensor (channels,) to (1, channels) for broadcasting (LC layout)
 static ggml_tensor * reshape_vector_lc(ggml_context * ctx, ggml_tensor * t, int64_t channels) {
     ggml_tensor * cur = (t->type == GGML_TYPE_F32) ? t : ggml_cast(ctx, t, GGML_TYPE_F32);
     return ggml_reshape_2d(ctx, cur, 1, channels);
 }
 
-// Add per-channel bias in CL (channels-last) layout: x is (C, T)
 static ggml_tensor * add_channel_bias_cl(ggml_context * ctx, ggml_tensor * x, ggml_tensor * bias) {
     return ggml_add(ctx, x, repeat_checked(ctx, reshape_vector_cl(ctx, bias, x->ne[0]), x, "repeat:bias_cl"));
 }
 
-// Add per-channel bias in LC (length-channels) layout: x is (T, C)
 static ggml_tensor * add_channel_bias_lc(ggml_context * ctx, ggml_tensor * x, ggml_tensor * bias) {
     return ggml_add(ctx, x, repeat_checked(ctx, reshape_vector_lc(ctx, bias, x->ne[1]), x, "repeat:bias_lc"));
 }
@@ -164,19 +165,16 @@ static ggml_tensor * snake_activation(ggml_context * ctx, ggml_tensor * x, ggml_
     return ggml_add(ctx, x, ggml_div(ctx, sin_sq, alpha_rep));
 }
 
-// Calculate extra right-padding for causal conv so output has ceil(T/stride) frames
 static int64_t extra_padding_for_conv1d(int64_t length, int kernel_size, int stride, int padding_total) {
     const float n_frames = (static_cast<float>(length - kernel_size + padding_total) / stride) + 1.0f;
     const int64_t ideal  = (static_cast<int64_t>(std::ceil(n_frames)) - 1) * stride + (kernel_size - padding_total);
     return ideal - length;
 }
 
-// Convert CL (C, T) → LC (T, C) (contiguous)
 static ggml_tensor * cl_to_lc(ggml_context * ctx, ggml_tensor * x) {
     return ggml_cont(ctx, ggml_transpose(ctx, x));
 }
 
-// Convert LC (T, C) → CL (C, T) (contiguous)
 static ggml_tensor * lc_to_cl(ggml_context * ctx, ggml_tensor * x) {
     ggml_tensor * xc = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
     ggml_tensor * x2 = ggml_reshape_2d(ctx, xc, xc->ne[0], xc->ne[1]);
@@ -184,7 +182,6 @@ static ggml_tensor * lc_to_cl(ggml_context * ctx, ggml_tensor * x) {
     return ggml_reshape_2d(ctx, tr, tr->ne[0], tr->ne[1]);
 }
 
-// Causal convolution: input x is CL (C, T)
 static ggml_tensor * causal_conv_1d(ggml_context * ctx,
                                      ggml_tensor * weight, ggml_tensor * bias,
                                      ggml_tensor * x, int stride, int dilation) {
@@ -198,7 +195,6 @@ static ggml_tensor * causal_conv_1d(ggml_context * ctx,
     return lc_to_cl(ctx, y);
 }
 
-// Causal transposed convolution: input x is CL (C, T), crop_right = stride
 static ggml_tensor * causal_conv_transpose_1d(ggml_context * ctx,
                                                ggml_tensor * weight, ggml_tensor * bias,
                                                ggml_tensor * x, int stride, int crop_right) {
@@ -227,23 +223,22 @@ static ggml_tensor * repeat_interleave_heads(ggml_context * ctx, ggml_tensor * x
     return ggml_reshape_3d(ctx, ggml_cont(ctx, rp), xf->ne[0], xf->ne[1] * rep, xf->ne[2]);
 }
 
-// ---------------------------------------------------------------------------
-// Transformer block used in encoder and quantizer
-// ---------------------------------------------------------------------------
-
 static void prepare_transformer_inputs(ggml_context * ctx, transformer_inputs & inp,
-                                        int32_t seq_len, int32_t window_size) {
+                                        int32_t seq_len, int32_t window_size,
+                                        bool force_explicit_causal_mask) {
     if (inp.positions != nullptr) return;
 
     inp.positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, seq_len);
     inp.position_values.resize(seq_len);
     for (int32_t i = 0; i < seq_len; ++i) inp.position_values[i] = i;
 
-    if (window_size > 0 && window_size < seq_len) {
+    const bool use_window_mask = window_size > 0 && window_size < seq_len;
+    const bool use_full_causal_mask = force_explicit_causal_mask && !use_window_mask;
+    if (use_window_mask || use_full_causal_mask) {
         inp.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq_len, seq_len);
         inp.mask_values.resize(static_cast<size_t>(seq_len) * seq_len);
         for (int32_t q = 0; q < seq_len; ++q) {
-            const int32_t min_k = std::max(0, q - window_size + 1);
+            const int32_t min_k = use_window_mask ? std::max(0, q - window_size + 1) : 0;
             for (int32_t k = 0; k < seq_len; ++k) {
                 const bool allowed = (k >= min_k && k <= q);
                 inp.mask_values[static_cast<size_t>(q) * seq_len + k] = allowed ? 0.0f : -1e9f;
@@ -256,13 +251,14 @@ static ggml_tensor * build_transformer(ggml_context * ctx, ggml_context * ctx_w,
                                         const std::string & prefix, ggml_tensor * x,
                                         int32_t block_size, int32_t n_local_heads, int32_t head_dim,
                                         float rope_base, float norm_eps, int32_t window_size,
+                                        bool force_explicit_causal_mask,
                                         transformer_inputs & inp) {
     const int32_t dim     = static_cast<int32_t>(x->ne[0]);
     const int32_t seq_len = static_cast<int32_t>(x->ne[1]);
     const int32_t n_head  = dim / head_dim;
     if (n_local_heads < 1) n_local_heads = n_head;
 
-    prepare_transformer_inputs(ctx, inp, seq_len, window_size);
+    prepare_transformer_inputs(ctx, inp, seq_len, window_size, force_explicit_causal_mask);
 
     for (int32_t i = 0;; ++i) {
         const std::string stem = prefix + ".layers." + std::to_string(i);
@@ -342,10 +338,6 @@ static ggml_tensor * build_transformer(ggml_context * ctx, ggml_context * ctx_w,
     return rms_norm_weighted_cl(ctx, x, norm_w, norm_eps);
 }
 
-// ---------------------------------------------------------------------------
-// Residual unit (decoder block)
-// ---------------------------------------------------------------------------
-
 static ggml_tensor * build_residual_unit(ggml_context * ctx, ggml_context * ctx_w,
                                           const std::string & prefix, ggml_tensor * x, int dilation) {
     auto req = [&](const std::string & n) -> ggml_tensor * {
@@ -360,10 +352,6 @@ static ggml_tensor * build_residual_unit(ggml_context * ctx, ggml_context * ctx_
     return ggml_add(ctx, x, y);
 }
 
-// ---------------------------------------------------------------------------
-// ConvNext block (used in quantizer up/down-sample)
-// ---------------------------------------------------------------------------
-
 static ggml_tensor * build_convnext_block(ggml_context * ctx, ggml_context * ctx_w,
                                            const std::string & prefix, ggml_tensor * x) {
     auto req = [&](const std::string & n) -> ggml_tensor * {
@@ -372,7 +360,6 @@ static ggml_tensor * build_convnext_block(ggml_context * ctx, ggml_context * ctx
         return t;
     };
 
-    // depthwise conv (conv_1d on each channel independently)
     ggml_tensor * dw_w = req(prefix + ".dwconv.conv.weight");
     ggml_tensor * dw_b = req(prefix + ".dwconv.conv.bias");
     const int kernel_size_dw = static_cast<int>(dw_w->ne[0]);
@@ -391,10 +378,6 @@ static ggml_tensor * build_convnext_block(ggml_context * ctx, ggml_context * ctx
     y = scale_channels_cl(ctx, y, req(prefix + ".gamma"));
     return ggml_add(ctx, x, y);
 }
-
-// ---------------------------------------------------------------------------
-// Encoder block
-// ---------------------------------------------------------------------------
 
 static ggml_tensor * build_encoder_block(ggml_context * ctx, AudioCodec::Impl & impl,
                                           const std::string & prefix, ggml_tensor * x,
@@ -419,14 +402,11 @@ static ggml_tensor * build_encoder_block(ggml_context * ctx, AudioCodec::Impl & 
                                impl.transformer_rope_base,
                                impl.transformer_norm_eps,
                                512,
+                               backend_requires_explicit_causal_mask(impl.backend),
                                inp);
     }
     return x;
 }
-
-// ---------------------------------------------------------------------------
-// Quantizer decode stage: post_module transformer + upsample
-// ---------------------------------------------------------------------------
 
 static ggml_tensor * build_quantizer_stage_up(ggml_context * ctx, AudioCodec::Impl & impl,
                                                const std::string & prefix, ggml_tensor * x, int factor) {
@@ -449,6 +429,7 @@ static ggml_tensor * build_quantizer_decode_stage(ggml_context * ctx, AudioCodec
                                          impl.rvq_transformer_rope_base,
                                          impl.rvq_transformer_norm_eps,
                                          impl.rvq_transformer_window_size,
+                                         backend_requires_explicit_causal_mask(impl.backend),
                                          inp);
     const size_t n = impl.quantizer_downsample_factor.size();
     for (size_t i = 0; i < n; ++i) {
@@ -457,10 +438,6 @@ static ggml_tensor * build_quantizer_decode_stage(ggml_context * ctx, AudioCodec
     }
     return x;
 }
-
-// ---------------------------------------------------------------------------
-// Decoder
-// ---------------------------------------------------------------------------
 
 static ggml_tensor * build_decoder_block(ggml_context * ctx, AudioCodec::Impl & impl,
                                           const std::string & prefix, ggml_tensor * x, int stride) {
@@ -506,10 +483,6 @@ static ggml_tensor * build_decoder(ggml_context * ctx, AudioCodec::Impl & impl, 
     return ggml_tanh(ctx, x);
 }
 
-// ---------------------------------------------------------------------------
-// Host-side VQ helpers (CPU computations)
-// ---------------------------------------------------------------------------
-
 static std::vector<float> tensor_to_f32(ggml_tensor * t) {
     const size_t n = ggml_nelements(t);
     std::vector<float> out(n);
@@ -543,7 +516,6 @@ static vq_cache load_vq_cache(ggml_context * ctx_w, const std::string & prefix,
     vq.out_proj_bias   = tensor_to_f32(req(prefix + ".out_proj.bias"));
     vq.codebook        = tensor_to_f32(req(prefix + ".codebook.weight"));
 
-    // Pre-compute L2-normalised codebook for nearest-neighbour search (encode)
     vq.codebook_norm.resize(vq.codebook.size());
     for (int32_t code = 0; code < vq.codebook_size; ++code) {
         float norm = 0.0f;
@@ -555,7 +527,6 @@ static vq_cache load_vq_cache(ggml_context * ctx_w, const std::string & prefix,
     return vq;
 }
 
-// Project input (frames, in_dim) → output (frames, out_dim) via linear
 static void project_1x1(const std::vector<float> & input, int32_t frames,
                          int32_t in_dim, int32_t out_dim,
                          const std::vector<float> & weight, const std::vector<float> & bias,
@@ -573,7 +544,6 @@ static void project_1x1(const std::vector<float> & input, int32_t frames,
     }
 }
 
-// Nearest-neighbour VQ quantisation; returns codes and projected output
 static void quantize_with_vq(const vq_cache & vq, const std::vector<float> & input, int32_t frames,
                                std::vector<int32_t> & codes, std::vector<float> & projected_out) {
     std::vector<float> latents;
@@ -598,7 +568,6 @@ static void quantize_with_vq(const vq_cache & vq, const std::vector<float> & inp
         }
         codes[t] = best;
 
-        // out_proj
         const float * cb = vq.codebook.data() + static_cast<size_t>(best) * vq.codebook_dim;
         float * dst = projected_out.data() + static_cast<size_t>(t) * vq.input_dim;
         for (int32_t o = 0; o < vq.input_dim; ++o) {
@@ -610,88 +579,141 @@ static void quantize_with_vq(const vq_cache & vq, const std::vector<float> & inp
     }
 }
 
-static void dequantize_one_vq(const vq_cache & vq, const int32_t * codes, int32_t frames,
-                               std::vector<float> & accum) {
-    for (int32_t t = 0; t < frames; ++t) {
-        int32_t code = codes[t];
-        if (code < 0) code = 0;
-        if (code >= vq.codebook_size) code = vq.codebook_size - 1;
-        const float * cb = vq.codebook.data() + static_cast<size_t>(code) * vq.codebook_dim;
-        float * dst = accum.data() + static_cast<size_t>(t) * vq.input_dim;
-        for (int32_t o = 0; o < vq.input_dim; ++o) {
-            float v = vq.out_proj_bias[o];
-            const float * w = vq.out_proj_weight.data() + static_cast<size_t>(o) * vq.codebook_dim;
-            for (int32_t d = 0; d < vq.codebook_dim; ++d) v += w[d] * cb[d];
-            dst[o] += v;
-        }
+static ggml_tensor * build_vq_decode_stage(ggml_context * ctx, ggml_context * ctx_w,
+                                            const std::string & prefix, ggml_tensor * code_ids) {
+    auto req = [&](const std::string & n) -> ggml_tensor * {
+        ggml_tensor * t = ggml_get_tensor(ctx_w, n.c_str());
+        if (!t) throw std::runtime_error("missing vq decode tensor: " + n);
+        return t;
+    };
+
+    ggml_tensor * codebook = req(prefix + ".codebook.weight");
+    ggml_tensor * out_proj_weight = req(prefix + ".out_proj.weight");
+    ggml_tensor * out_proj_bias = req(prefix + ".out_proj.bias");
+
+    if (out_proj_weight->ne[0] == 1 && out_proj_weight->ne[1] > 0 &&
+        out_proj_weight->ne[2] > 0 && out_proj_weight->ne[3] == 1) {
+        out_proj_weight = ggml_reshape_2d(ctx, out_proj_weight,
+                                          out_proj_weight->ne[1], out_proj_weight->ne[2]);
     }
+
+    ggml_tensor * gathered = ggml_get_rows(ctx, codebook, code_ids);
+    if (gathered->type != GGML_TYPE_F32) {
+        gathered = ggml_cast(ctx, gathered, GGML_TYPE_F32);
+    }
+
+    return linear_bias(ctx, out_proj_weight, out_proj_bias, gathered, "mul_mat:vq_out_proj");
 }
 
-// Decode (num_codebooks, frames) row-major codes → stage vector (frames, quantizer_input_dim)
-static bool decode_codes_stage(AudioCodec::Impl & impl, const int32_t * codes,
-                                int32_t n_frames, std::vector<float> & stage_out) {
-    stage_out.assign(static_cast<size_t>(n_frames) * impl.quantizer_input_dim, 0.0f);
-    const int32_t num_cb = impl.quantizer_residual_codebooks + 1;
-
-    // semantic codebook codes are at codes[0 * n_frames + t]
-    {
-        std::vector<int32_t> sem_codes(n_frames);
-        for (int32_t t = 0; t < n_frames; ++t) sem_codes[t] = codes[t];
-        dequantize_one_vq(impl.semantic_vq, sem_codes.data(), n_frames, stage_out);
+static ggml_tensor * build_decode_codes_stage_backend(ggml_context * ctx, AudioCodec::Impl & impl,
+                                                       const std::vector<ggml_tensor *> & code_id_tensors) {
+    if (code_id_tensors.empty()) {
+        throw std::runtime_error("missing code tensors for decode stage");
     }
-    // residual codebooks
+
+    ggml_tensor * stage = build_vq_decode_stage(
+        ctx, impl.ctx_w, impl.tprefix + "quantizer.semantic_quantizer.quantizers.0", code_id_tensors[0]);
+
     for (int32_t i = 0; i < impl.quantizer_residual_codebooks; ++i) {
-        std::vector<int32_t> cb_codes(n_frames);
-        for (int32_t t = 0; t < n_frames; ++t) cb_codes[t] = codes[(i + 1) * n_frames + t];
-        dequantize_one_vq(impl.residual_vq[i], cb_codes.data(), n_frames, stage_out);
-    }
-    return true;
-}
+        const size_t tensor_index = static_cast<size_t>(i + 1);
+        if (tensor_index >= code_id_tensors.size()) {
+            throw std::runtime_error("insufficient residual code tensors for decode stage");
+        }
 
-// ---------------------------------------------------------------------------
-// AudioCodec constructor / destructor
-// ---------------------------------------------------------------------------
+        ggml_tensor * residual = build_vq_decode_stage(
+            ctx, impl.ctx_w,
+            impl.tprefix + "quantizer.quantizer.quantizers." + std::to_string(i),
+            code_id_tensors[tensor_index]);
+        stage = ggml_add(ctx, stage, residual);
+    }
+
+    return stage;
+}
 
 AudioCodec::AudioCodec()  { impl_ = new Impl(); }
 AudioCodec::~AudioCodec() {
     if (impl_) {
-        if (impl_->ctx_w)     ggml_free(impl_->ctx_w);
-        if (impl_->model_buf) ggml_backend_buffer_free(impl_->model_buf);
-        if (impl_->backend)   ggml_backend_free(impl_->backend);
+        reset_codec_impl(*impl_);
         delete impl_;
         impl_ = nullptr;
     }
 }
 
-// ---------------------------------------------------------------------------
-// load()
-// ---------------------------------------------------------------------------
+const char * AudioCodec::backend_name() const {
+    if (!impl_ || !impl_->backend) {
+        return "unknown";
+    }
+    return ggml_backend_name(impl_->backend);
+}
 
-bool AudioCodec::load(const std::string & gguf_path, int32_t gpu_device, int32_t backend_type) {
-    if (gpu_device >= 0) {
+bool AudioCodec::load_shared(gguf_context * shared_gguf_ctx, const std::string & gguf_path, int32_t gpu_device, BackendType backend_type) {
+    if (!impl_) {
+        impl_ = new Impl();
+    } else {
+        reset_codec_impl(*impl_);
+    }
+    sample_rate_ = 44100;
+    hop_length_ = 512;
+    num_codebooks_ = 10;
+    samples_per_code_frame_ = 2048;
+    streaming_history_frames_ = 160;
+    bool warned_backend_fallback = false;
+
+    const bool wants_gpu_backend =
+        backend_type != BackendType::CPU &&
+        (gpu_device >= 0 || backend_type == BackendType::Metal);
+
+    if (wants_gpu_backend) {
 #ifdef GGML_USE_VULKAN
-        if (!impl_->backend && backend_type == 0) {
+        if (!impl_->backend && backend_type == BackendType::Vulkan) {
             impl_->backend = ggml_backend_vk_init(static_cast<size_t>(gpu_device));
             if (!impl_->backend) {
-                std::cerr << "[Codec] Vulkan init failed, falling back to CPU." << std::endl;
+                S2_LOG_WARN_STREAM("[Codec] Vulkan init failed, falling back to CPU." << std::endl);
+                warned_backend_fallback = true;
             }
         }
 #endif
 #ifdef GGML_USE_CUDA
-        if (!impl_->backend && backend_type == 1) {
+        if (!impl_->backend && backend_type == BackendType::CUDA) {
             impl_->backend = ggml_backend_cuda_init(static_cast<size_t>(gpu_device));
             if (!impl_->backend) {
-                std::cerr << "[Codec] Cuda init failed, falling back to CPU." << std::endl;
+                S2_LOG_WARN_STREAM("[Codec] Cuda init failed, falling back to CPU." << std::endl);
+                warned_backend_fallback = true;
+            }
+        }
+#endif
+#ifdef GGML_USE_METAL
+        if (!impl_->backend && backend_type == BackendType::Metal) {
+            impl_->backend = ggml_backend_metal_init();
+            if (!impl_->backend) {
+                S2_LOG_WARN_STREAM("[Codec] Metal init failed, falling back to CPU." << std::endl);
+                warned_backend_fallback = true;
             }
         }
 #endif
     }
+    if (!impl_->backend && wants_gpu_backend && !warned_backend_fallback) {
+        S2_LOG_WARN_STREAM("[Codec] Requested " << backend_type_name(backend_type)
+                  << " backend unavailable, falling back to CPU." << std::endl);
+    }
     if (!impl_->backend) impl_->backend = ggml_backend_cpu_init();
-    if (!impl_->backend) { std::cerr << "[Codec] No backend." << std::endl; return false; }
+    if (!impl_->backend) {
+        std::cerr << "[Codec] No backend." << std::endl;
+        reset_codec_impl(*impl_);
+        return false;
+    }
 
     struct gguf_init_params params = { true, &impl_->ctx_w };
-    gguf_context * gguf_ctx = gguf_init_from_file(gguf_path.c_str(), params);
-    if (!gguf_ctx) { std::cerr << "[Codec] Failed to open " << gguf_path << std::endl; return false; }
+    gguf_context * local_gguf = gguf_init_from_file(gguf_path.c_str(), params);
+    if (!local_gguf) {
+        std::cerr << "[Codec] Failed to open " << gguf_path << std::endl;
+        reset_codec_impl(*impl_);
+        return false;
+    }
+
+    gguf_free(local_gguf);
+
+    gguf_context * gguf_ctx = shared_gguf_ctx;
 
     try {
         auto req_str = [&](const char * k) -> std::string {
@@ -786,40 +808,49 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t gpu_device, int32_t
         sample_rate_    = impl_->sample_rate;
         hop_length_     = impl_->hop_length;
         num_codebooks_  = impl_->quantizer_residual_codebooks + 1;
+        int32_t code_frame_factor = 1;
+        for (int32_t factor : impl_->quantizer_downsample_factor) {
+            if (factor > 0 && code_frame_factor <= (std::numeric_limits<int32_t>::max() / factor)) {
+                code_frame_factor *= factor;
+            }
+        }
+        if (code_frame_factor <= 0) {
+            code_frame_factor = 1;
+        }
+        samples_per_code_frame_ = hop_length_ * code_frame_factor;
 
-        // Allocate and load tensor data
+        const int32_t rvq_history = std::max(0, impl_->rvq_transformer_window_size - 1);
+        streaming_history_frames_ = ((rvq_history + 16 + 7) / 8) * 8;
+        if (streaming_history_frames_ <= 0) {
+            streaming_history_frames_ = 160;
+        }
+
         impl_->model_buf = ggml_backend_alloc_ctx_tensors(impl_->ctx_w, impl_->backend);
         if (!impl_->model_buf) throw std::runtime_error("ggml_backend_alloc_ctx_tensors() failed");
 
-        const size_t data_offset = gguf_get_data_offset(gguf_ctx);
-        const int64_t n_tensors  = gguf_get_n_tensors(gguf_ctx);
-        std::FILE * f = std::fopen(gguf_path.c_str(), "rb");
-        if (!f) throw std::runtime_error("failed to reopen codec file");
-        for (int64_t ti = 0; ti < n_tensors; ++ti) {
-            const char * name = gguf_get_tensor_name(gguf_ctx, ti);
-            ggml_tensor * t = ggml_get_tensor(impl_->ctx_w, name);
-            if (!t) continue;
-            const size_t off   = data_offset + gguf_get_tensor_offset(gguf_ctx, ti);
-            const size_t nbytes = ggml_nbytes(t);
-            std::vector<uint8_t> tmp(nbytes);
-#ifdef _WIN32
-            _fseeki64(f, (int64_t)off, SEEK_SET);
-#else
-            fseeko(f, (off_t)off, SEEK_SET);
-#endif
-            if (std::fread(tmp.data(), 1, nbytes, f) != nbytes) {
-                std::fclose(f);
-                throw std::runtime_error(std::string("failed to read tensor: ") + name);
-            }
-            ggml_backend_tensor_set(t, tmp.data(), 0, nbytes);
-        }
-        std::fclose(f);
+        impl_->semantic_vq = vq_cache();
+        impl_->residual_vq.clear();
+    } catch (const std::exception & e) {
+        std::cerr << "[Codec] " << e.what() << std::endl;
+        reset_codec_impl(*impl_);
+        return false;
+    }
+    S2_LOG_INFO_STREAM("[Codec] Backend: " << backend_name() << std::endl);
+    return true;
+}
 
-        // Load VQ caches (CPU copies of codebooks)
+bool AudioCodec::refresh_host_caches() {
+    if (!impl_ || !impl_->ctx_w) {
+        return false;
+    }
+
+    try {
         impl_->semantic_vq = load_vq_cache(impl_->ctx_w,
             impl_->tprefix + "quantizer.semantic_quantizer.quantizers.0",
             impl_->quantizer_input_dim, impl_->quantizer_codebook_dim,
             impl_->quantizer_semantic_codebook_size);
+
+        impl_->residual_vq.clear();
         impl_->residual_vq.reserve(impl_->quantizer_residual_codebooks);
         for (int32_t i = 0; i < impl_->quantizer_residual_codebooks; ++i) {
             impl_->residual_vq.push_back(load_vq_cache(impl_->ctx_w,
@@ -828,27 +859,84 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t gpu_device, int32_t
                 impl_->quantizer_residual_codebook_size));
         }
     } catch (const std::exception & e) {
-        std::cerr << "[Codec] " << e.what() << std::endl;
-        gguf_free(gguf_ctx);
+        std::cerr << "[Codec] Failed to refresh VQ caches: " << e.what() << std::endl;
+        impl_->semantic_vq = vq_cache();
+        impl_->residual_vq.clear();
         return false;
     }
-    gguf_free(gguf_ctx);
+
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// encode()  — audio (mono float32) → codes (num_codebooks, T) row-major
-// ---------------------------------------------------------------------------
+bool AudioCodec::read_tensor_data(const std::string & gguf_path, gguf_context * gguf_ctx) {
+    if (!impl_ || !impl_->ctx_w) return false;
+
+    const size_t data_offset = gguf_get_data_offset(gguf_ctx);
+    const int64_t n_tensors  = gguf_get_n_tensors(gguf_ctx);
+
+    std::FILE * f = std::fopen(gguf_path.c_str(), "rb");
+    if (!f) {
+        std::cerr << "[Codec] Failed to reopen " << gguf_path << " for data loading." << std::endl;
+        return false;
+    }
+    for (int64_t ti = 0; ti < n_tensors; ++ti) {
+        const char * name = gguf_get_tensor_name(gguf_ctx, ti);
+        ggml_tensor * t = ggml_get_tensor(impl_->ctx_w, name);
+        if (!t) continue;
+        const size_t off   = data_offset + gguf_get_tensor_offset(gguf_ctx, ti);
+        const size_t nbytes = ggml_nbytes(t);
+        std::vector<uint8_t> tmp(nbytes);
+#ifdef _WIN32
+        _fseeki64(f, (int64_t)off, SEEK_SET);
+#else
+        fseeko(f, (off_t)off, SEEK_SET);
+#endif
+        if (std::fread(tmp.data(), 1, nbytes, f) != nbytes) {
+            std::fclose(f);
+            std::cerr << "[Codec] Failed to read tensor: " << name << std::endl;
+            return false;
+        }
+        ggml_backend_tensor_set(t, tmp.data(), 0, nbytes);
+    }
+    std::fclose(f);
+    return refresh_host_caches();
+}
+
+bool AudioCodec::load(const std::string & gguf_path, int32_t gpu_device, BackendType backend_type) {
+
+    struct gguf_init_params params = { true, nullptr };
+    gguf_context * ctx_gguf = gguf_init_from_file(gguf_path.c_str(), params);
+    if (!ctx_gguf) {
+        std::cerr << "[Codec] Failed to open " << gguf_path << std::endl;
+        return false;
+    }
+
+    if (!load_shared(ctx_gguf, gguf_path, gpu_device, backend_type)) {
+        gguf_free(ctx_gguf);
+        return false;
+    }
+
+    if (!read_tensor_data(gguf_path, ctx_gguf)) {
+        gguf_free(ctx_gguf);
+        return false;
+    }
+
+    gguf_free(ctx_gguf);
+    return true;
+}
+
+ggml_context * AudioCodec::weights_ctx() const {
+    return impl_ ? impl_->ctx_w : nullptr;
+}
 
 bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_threads,
                          std::vector<int32_t> & codes_out, int32_t & n_frames_out) {
-    // Pad audio to multiple of frame_length
+
     const int32_t frame_length = (impl_->frame_length > 0) ? impl_->frame_length : 512;
     const int32_t padded = ((n_samples + frame_length - 1) / frame_length) * frame_length;
     std::vector<float> audio_padded(padded, 0.0f);
     std::copy(audio, audio + n_samples, audio_padded.begin());
 
-    // --- Encoder graph ---
     const size_t ctx_size = 128u * 1024u * 1024u;
     std::vector<uint8_t> ctx_buf(ctx_size);
     ggml_init_params p = { ctx_size, ctx_buf.data(), true };
@@ -859,7 +947,7 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
     ggml_tensor * audio_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, padded);
     ggml_tensor * latent    = nullptr;
     try {
-        // Build encoder graph
+
         ggml_tensor * x = causal_conv_1d(ctx,
             ggml_get_tensor(impl_->ctx_w, (impl_->tprefix + "encoder.block.0.conv.weight").c_str()),
             ggml_get_tensor(impl_->ctx_w, (impl_->tprefix + "encoder.block.0.conv.bias").c_str()),
@@ -924,7 +1012,6 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
 
-    // --- Quantizer encode stage graph ---
     {
         const size_t ctx2_size = 96u * 1024u * 1024u;
         std::vector<uint8_t> ctx2_buf(ctx2_size);
@@ -955,6 +1042,7 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
                                     impl_->rvq_transformer_rope_base,
                                     impl_->rvq_transformer_norm_eps,
                                     impl_->rvq_transformer_window_size,
+                                    backend_requires_explicit_causal_mask(impl_->backend),
                                     qenc_inp);
             stage = ggml_cpy(ctx2, x2, ggml_new_tensor_2d(ctx2, GGML_TYPE_F32, x2->ne[0], x2->ne[1]));
         } catch (const std::exception & e) {
@@ -997,8 +1085,6 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
         ggml_gallocr_free(allocr2);
         ggml_free(ctx2);
 
-        // --- VQ encode (CPU) ---
-        // Result: codes_out in row-major (num_codebooks, stage_frames)
         std::vector<float> residual = stage_out;
         std::vector<int32_t> sem_codes;
         std::vector<float> sem_proj;
@@ -1023,19 +1109,10 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// decode()  — codes (num_codebooks, n_frames) row-major → mono float32 audio
-// ---------------------------------------------------------------------------
-
 bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threads,
                          std::vector<float> & audio_out) {
     if (n_frames <= 0) return false;
 
-    // Step 1: dequantize VQ codes to stage vector (n_frames, quantizer_input_dim)
-    std::vector<float> stage;
-    if (!decode_codes_stage(*impl_, codes, n_frames, stage)) return false;
-
-    // Step 2: quantizer decode stage (post_module transformer + upsample)
     int32_t latent_frames = 0;
     std::vector<float> latent_out;
     {
@@ -1046,10 +1123,15 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
         if (!ctx) return false;
 
         transformer_inputs inp;
-        ggml_tensor * stage_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, impl_->quantizer_input_dim, n_frames);
+        const int32_t num_codebooks = impl_->quantizer_residual_codebooks + 1;
+        std::vector<ggml_tensor *> code_id_tensors(static_cast<size_t>(num_codebooks));
+        for (int32_t cb = 0; cb < num_codebooks; ++cb) {
+            code_id_tensors[static_cast<size_t>(cb)] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_frames);
+        }
         ggml_tensor * latent   = nullptr;
         try {
-            latent = build_quantizer_decode_stage(ctx, *impl_, stage_in, inp);
+            ggml_tensor * stage = build_decode_codes_stage_backend(ctx, *impl_, code_id_tensors);
+            latent = build_quantizer_decode_stage(ctx, *impl_, stage, inp);
             latent = ggml_cpy(ctx, latent, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, latent->ne[0], latent->ne[1]));
         } catch (const std::exception & e) {
             std::cerr << "[Codec::decode] quantizer decode stage failed: " << e.what() << std::endl;
@@ -1067,7 +1149,38 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
             return false;
         }
 
-        ggml_backend_tensor_set(stage_in, stage.data(), 0, stage.size() * sizeof(float));
+        std::vector<int32_t> sanitized_codes(static_cast<size_t>(num_codebooks) * n_frames);
+        auto clamp_code = [](int32_t code, int32_t codebook_size) -> int32_t {
+            if (code < 0) {
+                return 0;
+            }
+            if (code >= codebook_size) {
+                return codebook_size - 1;
+            }
+            return code;
+        };
+
+        for (int32_t t = 0; t < n_frames; ++t) {
+            sanitized_codes[static_cast<size_t>(t)] =
+                clamp_code(codes[t], impl_->quantizer_semantic_codebook_size);
+        }
+        for (int32_t cb = 0; cb < impl_->quantizer_residual_codebooks; ++cb) {
+            const size_t src_offset = static_cast<size_t>(cb + 1) * n_frames;
+            const size_t dst_offset = static_cast<size_t>(cb + 1) * n_frames;
+            for (int32_t t = 0; t < n_frames; ++t) {
+                sanitized_codes[dst_offset + static_cast<size_t>(t)] =
+                    clamp_code(codes[src_offset + static_cast<size_t>(t)],
+                               impl_->quantizer_residual_codebook_size);
+            }
+        }
+
+        for (int32_t cb = 0; cb < num_codebooks; ++cb) {
+            ggml_backend_tensor_set(
+                code_id_tensors[static_cast<size_t>(cb)],
+                sanitized_codes.data() + static_cast<size_t>(cb) * n_frames,
+                0,
+                static_cast<size_t>(n_frames) * sizeof(int32_t));
+        }
         if (inp.positions) {
             ggml_backend_tensor_set(inp.positions, inp.position_values.data(), 0,
                                     inp.position_values.size() * sizeof(int32_t));
@@ -1092,7 +1205,6 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
         ggml_free(ctx);
     }
 
-    // Step 3: decoder graph
     {
         const size_t ctx_size = 128u * 1024u * 1024u;
         std::vector<uint8_t> ctx_buf(ctx_size);
@@ -1130,7 +1242,6 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
             return false;
         }
 
-        // audio_t is (1, T) or (C, T) — we expect (1, T), take total elements
         const int32_t n_samples = static_cast<int32_t>(ggml_nelements(audio_t));
         audio_out.resize(n_samples);
         ggml_backend_tensor_get(audio_t, audio_out.data(), 0, n_samples * sizeof(float));
@@ -1140,4 +1251,4 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
     return true;
 }
 
-} // namespace s2
+}
