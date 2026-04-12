@@ -17,7 +17,7 @@ endif()
 foreach(_patch IN LISTS S2_PATCH_FILES)
 if(WIN32)
     execute_process(
-        COMMAND "${S2_PATCH_EXECUTABLE}" apply --stat -p1 -i "${_patch}"
+        COMMAND "${S2_PATCH_EXECUTABLE}" apply --check -p1 "${_patch}"
         WORKING_DIRECTORY "${S2_PATCH_ROOT}"
         RESULT_VARIABLE _can_apply
         OUTPUT_QUIET
@@ -56,19 +56,19 @@ endif()
 
 if(WIN32)
     execute_process(
-		COMMAND "${S2_PATCH_EXECUTABLE}" apply --stat -R -p1 "${_patch}"
+		COMMAND "${S2_PATCH_EXECUTABLE}" apply --check --reverse -p1 "${_patch}"
         WORKING_DIRECTORY "${S2_PATCH_ROOT}"
         RESULT_VARIABLE _already_applied
-        #OUTPUT_QUIET
-        #ERROR_QUIET
+        OUTPUT_QUIET
+        ERROR_QUIET
     )
 else()
     execute_process(
 		COMMAND "${S2_PATCH_EXECUTABLE}" --batch --dry-run -R -p1 -i "${_patch}"
         WORKING_DIRECTORY "${S2_PATCH_ROOT}"
         RESULT_VARIABLE _already_applied
-        #OUTPUT_QUIET
-        #ERROR_QUIET
+        OUTPUT_QUIET
+        ERROR_QUIET
     )
 endif()
 
