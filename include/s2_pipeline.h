@@ -44,6 +44,11 @@ public:
     AudioCodec  codec_;
     mutable std::mutex synthesize_mutex_;
     bool initialized_ = false;
+
+    // Cached reference voice (pre-encoded from -pa / -pt at startup)
+    std::vector<int32_t> ref_codes_cache_;
+    int32_t              T_prompt_cache_ = 0;
+    std::string          prompt_text_cache_;
 };
 
 }

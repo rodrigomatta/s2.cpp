@@ -45,6 +45,29 @@ bool Pipeline::init(const PipelineParams & params) {
         if (hp.vocab_size        > 0) tc.vocab_size        = hp.vocab_size;
     }
 
+    // Pre-encode reference voice once if -pa / -pt were provided
+    if (!params.prompt_audio_path.empty()) {
+        if (params.prompt_text.empty()) {
+            safe_print_error_ln("Pipeline warning: -pa provided without -pt, skipping voice cache.");
+        } else {
+            safe_print_ln("Pre-encoding reference audio for voice caching...");
+            AudioData ref_audio;
+            if (load_audio(params.prompt_audio_path, ref_audio, codec_.sample_rate())) {
+                if (codec_.encode(ref_audio.samples.data(), (int32_t)ref_audio.samples.size(),
+                                  params.gen.n_threads, ref_codes_cache_, T_prompt_cache_)) {
+                    prompt_text_cache_ = params.prompt_text;
+                    safe_print_ln("Voice cached successfully.");
+                } else {
+                    safe_print_error_ln("Pipeline warning: failed to encode reference audio, voice not cached.");
+                    ref_codes_cache_.clear();
+                    T_prompt_cache_ = 0;
+                }
+            } else {
+                safe_print_error_ln("Pipeline warning: failed to load reference audio, voice not cached.");
+            }
+        }
+    }
+
     initialized_ = true;
     return true;
 }
@@ -160,10 +183,23 @@ bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_aud
         }
     }
 
+    // Fall back to pre-encoded voice cache when no fresh audio was provided
+    const std::vector<int32_t>* codes_to_use = &ref_codes;
+    int32_t T_prompt_to_use = T_prompt;
+    std::string prompt_text_to_use = params.prompt_text;
+
+    if (ref_codes.empty() && !ref_codes_cache_.empty()) {
+        codes_to_use     = &ref_codes_cache_;
+        T_prompt_to_use  = T_prompt_cache_;
+        if (prompt_text_to_use.empty()) {
+            prompt_text_to_use = prompt_text_cache_;
+        }
+    }
+
     PromptTensor prompt = build_prompt(
-        tokenizer_, params.text, params.prompt_text,
-        ref_codes.empty() ? nullptr : ref_codes.data(),
-        num_codebooks, T_prompt);
+        tokenizer_, params.text, prompt_text_to_use,
+        codes_to_use->empty() ? nullptr : codes_to_use->data(),
+        num_codebooks, T_prompt_to_use);
 
     int32_t max_seq_len = prompt.cols + params.gen.max_new_tokens;
     if (!model_.init_kv_cache(max_seq_len)) {

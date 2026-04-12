@@ -87,6 +87,11 @@ namespace s2
                 pipelineParams.prompt_text = get_first_form_field(
                     req.form, {"reference_text", "ref_text", "prompt_text"});
 
+                // If request didn't supply reference text, fall back to the CLI default
+                if (pipelineParams.prompt_text.empty()) {
+                    pipelineParams.prompt_text = params.pipeline.prompt_text;
+                }
+
                 if (req.form.has_field("params"))
                 {
                     try {
