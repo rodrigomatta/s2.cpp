@@ -203,7 +203,11 @@ int main(int argc, char** argv) {
         }
         else if (arg == "--codec-context-frames") {
             if (i+1 < argc) {
+#ifdef WIN32
+                try { params.codec_decode_context_frames = max(0, std::stoi(argv[++i])); } catch(...) {}
+#else
                 try { params.codec_decode_context_frames = std::max(0, std::stoi(argv[++i])); } catch(...) {}
+#endif
             }
         }
         else if (arg == "--log-level") {
