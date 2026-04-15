@@ -32,7 +32,7 @@ public:
                 std::vector<int32_t> & codes_out, int32_t & n_frames_out);
 
     bool decode(const int32_t * codes, int32_t n_frames, int32_t n_threads,
-                std::vector<float> & audio_out);
+        std::vector<float> & audio_out);
 
     int32_t sample_rate()     const { return sample_rate_; }
     int32_t hop_length()      const { return hop_length_; }
