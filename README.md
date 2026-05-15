@@ -9,7 +9,15 @@
 > The model weights are licensed under the Fish Audio Research License, Copyright © 39 AI, INC. All Rights Reserved.
 > See [LICENSE.md](LICENSE.md) for full terms. Commercial use requires a separate license from Fish Audio — contact [business@fish.audio](mailto:business@fish.audio).
 
-Project history and attribution notes are tracked in [CHANGELOG.md](CHANGELOG.md).
+---
+
+## Contributors
+
+- [@felipeov1](https://github.com/felipeov1)
+- [@ivanodintsov](https://github.com/ivanodintsov)
+- [@kolulu23](https://github.com/kolulu23)
+- [@rodrigomatta](https://github.com/rodrigomatta)
+- [@subspecs](https://github.com/subspecs)
 
 ---
 
@@ -28,11 +36,12 @@ The engine runs the full pipeline: text → tokens → Slow-AR transformer (with
 ## Model variants
 
 GGUF files are available at [rodrigomt/s2-pro-gguf](https://huggingface.co/rodrigomt/s2-pro-gguf) on Hugging Face.
+VRAM notes in this table were re-tested after fixing the duplicate weight load path that had previously inflated GPU memory usage.
 
 | File | Size | Notes |
 |---|---|---|
 | `s2-pro-f16.gguf` | 9.9 GB | Full precision — reference quality |
-| `s2-pro-q8_0.gguf` | 5.6 GB | Near-lossless — recommended for 8+ GB VRAM |
+| `s2-pro-q8_0.gguf` | 5.6 GB | Near-lossless — re-tested at ~5 GB VRAM; recommended for 8 GB GPUs |
 | `s2-pro-q6_k.gguf` | 4.5 GB | Good quality/size balance — recommended for 6+ GB VRAM |
 | `s2-pro-q5_k_m.gguf` | 4.0 GB | Smaller with still-good quality |
 | `s2-pro-q4_k_m.gguf` | 3.6 GB | Best compact variant so far in quick RU validation |
