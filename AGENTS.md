@@ -78,7 +78,7 @@ This builds:
 
 ### Disable local ggml patch application
 
-By default, configure/build applies local patches from `patches/*.patch` through
+By default, the build applies local patches from `patches/*.patch` through
 `cmake/apply_local_patches.cmake`.
 
 To disable that behavior:
@@ -258,6 +258,7 @@ Responsibilities:
 - Decode generated code frames back to waveform
 - Load codec tensors from the same GGUF file
 - Run on CPU by default, or optionally follow / benchmark GPU backends
+- Reuse a fused decode graph cache for non-CPU decode when frame count permits
 
 Important current behavior:
 
@@ -266,6 +267,11 @@ Important current behavior:
   the codec stays on CPU, follows the selected backend, or benchmarks CPU vs GPU
   for best throughput
 - If GPU codec init/allocation fails, the runtime falls back to CPU
+- Non-CPU codec decode attempts a cached fused graph first; allocation, graph
+  build, or compute failure falls back to the split decode path and remembers
+  failed frame counts
+- `AudioCodec::clear_decode_cache()` releases the cached decode graph and
+  backend allocator state
 
 #### Pipeline orchestration
 
@@ -280,6 +286,7 @@ Responsibilities:
 - Load shared GGUF state across model + codec
 - Select codec backend
 - Run offline synthesis, streaming synthesis, and in-memory synthesis
+- Clear codec decode cache state at synthesis boundaries
 - Handle voice profile save/load compatibility checks
 - Apply post-processing: trim, normalize, dynamic normalize
 - On Linux, call `posix_fadvise(..., POSIX_FADV_DONTNEED)` after loading weights
@@ -300,7 +307,9 @@ Responsibilities:
 
 Current user-facing flows:
 
-- `--voice <id-or-path.s2voice>`
+- CLI: `--voice <id>`
+- HTTP/export API voice selection accepts either a profile id or a `.s2voice`
+  path and maps paths to `voice_storage_dir` + profile stem
 - `--save-voice`
 - `--voice-dir`
 - `--list-voices`
@@ -387,6 +396,9 @@ If you touch:
 - CLI flags: update `src/main.cpp` help text and `README.md`
 - HTTP request/response behavior: update `src/s2_server.cpp`, `openapi/`, and
   `README.md`
+- codec decode caching or fallback behavior: update `include/s2_codec.h`,
+  `src/s2_codec.cpp`, and pipeline cache lifetime handling in
+  `src/s2_pipeline.cpp`
 - voice profile format: update `include/s2_voice.h`, `src/s2_voice.cpp`,
   loading compatibility checks, and docs
 - exported ABI: update `include/s2_export_api.h`, `src/s2_export_api.cpp`, and

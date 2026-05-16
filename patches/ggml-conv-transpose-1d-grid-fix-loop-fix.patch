@@ -72,7 +72,7 @@
  
 -    const int num_blocks = (output_size + CUDA_CONV_TRANPOSE_1D_BLOCK_SIZE - 1) / CUDA_CONV_TRANPOSE_1D_BLOCK_SIZE;
 +    const int num_blocks = std::min((int64_t)65535, (output_size + CUDA_CONV_TRANPOSE_1D_BLOCK_SIZE - 1) / CUDA_CONV_TRANPOSE_1D_BLOCK_SIZE);
-+    
++
      conv_transpose_1d_kernel<<<num_blocks,CUDA_CONV_TRANPOSE_1D_BLOCK_SIZE, 0, stream>>>(
          s0,p0,d0,output_size,
          src0_ne0, src0_ne1,  src0_ne2, src0_ne3,
@@ -82,4 +82,3 @@
          src0_d, src1_d, dst_d, stream);
 -}
 +}
-\ No newline at end of file

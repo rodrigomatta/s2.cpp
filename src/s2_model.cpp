@@ -186,7 +186,6 @@ static bool allocate_weight_buffers(ggml_backend_t backend,
 SlowARModel::SlowARModel() {}
 
 SlowARModel::~SlowARModel() {
-
     if (fast_sched_)     ggml_backend_sched_free(fast_sched_);
     if (sched_)          ggml_backend_sched_free(sched_);
 
@@ -194,11 +193,12 @@ SlowARModel::~SlowARModel() {
     free_backend_buffers(weights_.model_bufs_gpu);
     free_backend_buffers(weights_.model_bufs_cpu);
 
-    if (ctx_kv_)         ggml_free(ctx_kv_);
-    if (weights_.ctx_w)  ggml_free(weights_.ctx_w);
-
     if (backend_gpu_)    ggml_backend_free(backend_gpu_);
     if (backend_cpu_)    ggml_backend_free(backend_cpu_);
+
+    if (ctx_kv_)         ggml_free(ctx_kv_);
+
+    weights_.ctx_w = nullptr;
 }
 
 bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_path, int32_t gpu_device, BackendType backend_type, int32_t n_gpu_layers) {
@@ -1063,6 +1063,7 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
 
     if (!ggml_backend_sched_alloc_graph(sched_, gf)) {
         std::fprintf(stderr, "[eval_cached] sched alloc failed\n");
+        ggml_backend_sched_reset(sched_);
         ggml_free(ctx0);
         return false;
     }
@@ -1079,6 +1080,7 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
 
     if (ggml_backend_sched_graph_compute(sched_, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[eval_cached] sched compute failed\n");
+        ggml_backend_sched_reset(sched_);
         ggml_free(ctx0);
         return false;
     }
@@ -1088,6 +1090,7 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
     ggml_backend_tensor_get(hidden_last, result.hidden.data(), 0, dim * sizeof(float));
     ggml_backend_tensor_get(logits,      result.logits.data(), 0, hparams_.vocab_size * sizeof(float));
 
+    ggml_backend_sched_reset(sched_);
     ggml_free(ctx0);
     n_past_ += n_tokens;
     return true;
@@ -1224,6 +1227,7 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
 
     if (!ggml_backend_sched_alloc_graph(fast_sched_, gf)) {
         std::fprintf(stderr, "[fast_decode] sched alloc failed\n");
+        ggml_backend_sched_reset(fast_sched_);
         ggml_free(ctx0);
         return false;
     }
@@ -1237,6 +1241,7 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
 
     if (ggml_backend_sched_graph_compute(fast_sched_, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[fast_decode] sched compute failed\n");
+        ggml_backend_sched_reset(fast_sched_);
         ggml_free(ctx0);
         return false;
     }
@@ -1244,6 +1249,7 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
     logits_out.resize(hparams_.codebook_size);
     ggml_backend_tensor_get(logits, logits_out.data(), 0, hparams_.codebook_size * sizeof(float));
 
+    ggml_backend_sched_reset(fast_sched_);
     ggml_free(ctx0);
     return true;
 }

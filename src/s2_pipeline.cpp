@@ -104,6 +104,18 @@ static const char * backend_type_name(BackendType backend_type) {
     return "Unknown";
 }
 
+struct CodecDecodeCacheScope {
+    explicit CodecDecodeCacheScope(AudioCodec & codec) : codec_(codec) {
+        codec_.clear_decode_cache();
+    }
+
+    ~CodecDecodeCacheScope() {
+        codec_.clear_decode_cache();
+    }
+
+    AudioCodec & codec_;
+};
+
 static void safe_print_ln(const std::string& msg) {
     if (!log_enabled(LogLevel::Info)) return;
     fputs(msg.c_str(), stdout);
@@ -821,6 +833,7 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         return false;
     }
 
+    CodecDecodeCacheScope codec_decode_cache_scope(codec());
     model().clear_kv_cache();
 
     safe_print_ln("--- Pipeline Synthesize ---");
@@ -950,6 +963,7 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
         return false;
     }
 
+    CodecDecodeCacheScope codec_decode_cache_scope(codec());
     model().clear_kv_cache();
 
     safe_print_ln("--- Pipeline Streaming Synthesize ---");

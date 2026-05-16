@@ -333,7 +333,7 @@ private:
             on_error("Streaming callback on_wav_chunk is required");
             return false;
         }
-#ifdef WIN32 //Fixes conflict of #max defines for MSVC builds.
+#ifdef WIN32
         if (size > static_cast<size_t>(INT_MAX)) {
 #else
         if (size > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {

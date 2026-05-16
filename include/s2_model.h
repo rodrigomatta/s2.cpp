@@ -130,7 +130,7 @@ public:
 
     const ModelHParams & hparams() const { return hparams_; }
 
-    ModelWeights   weights_; //So they would be sharable.
+    ModelWeights   weights_;
 
 private:
     ModelHParams   hparams_;

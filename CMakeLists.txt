@@ -9,9 +9,6 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# ---------------------------------------------------------------------------
-# Options
-# ---------------------------------------------------------------------------
 option(S2_VULKAN  "Build with Vulkan backend"  OFF)
 option(S2_CUDA    "Build with CUDA backend"    OFF)
 option(S2_METAL   "Build with Metal backend"   OFF)
@@ -22,15 +19,12 @@ if(S2_METAL AND NOT APPLE)
     message(FATAL_ERROR "S2_METAL is only supported on Apple platforms.")
 endif()
 
-# ---------------------------------------------------------------------------
-# GGML (git submodule — optional local patches may be applied during build)
-# ---------------------------------------------------------------------------
 set(GGML_BUILD_TESTS  OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
 if(S2_AUTO_APPLY_LOCAL_PATCHES)
 
-	if(WIN32) #Fixes issue with patch not being available in Windows builds.
+	if(WIN32)
 		find_program(S2_PATCH_EXECUTABLE git)
 	else()
 		find_program(S2_PATCH_EXECUTABLE patch)
@@ -76,9 +70,6 @@ if(TARGET s2_apply_local_patches)
     endforeach()
 endif()
 
-# ---------------------------------------------------------------------------
-# s2 targets
-# ---------------------------------------------------------------------------
 set(S2_CORE_SOURCES
     src/s2_audio.cpp
     src/s2_tokenizer.cpp
@@ -113,7 +104,6 @@ if(S2_METAL)
     target_compile_definitions(${target_name} PRIVATE GGML_USE_METAL)
 endif()
 
-# Platform-specific
 if(UNIX AND NOT APPLE)
     target_link_libraries(${target_name} PRIVATE pthread m)
 endif()
@@ -161,7 +151,6 @@ if(S2_BUILD_SHARED_LIBRARIES)
         RUNTIME DESTINATION bin)
 endif()
 
-# Install
 install(TARGETS s2 RUNTIME DESTINATION bin)
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
     DESTINATION include

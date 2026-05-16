@@ -203,17 +203,17 @@ Example: realtime Python playback on Linux through the exported library API, usi
 LD_LIBRARY_PATH=build-vulkan:build-vulkan/ggml/src \
 python3 examples/python/ctypes_export_api.py \
   --library build-vulkan/libs2.so \
-  --model /home/rodrigo/Documentos/ggufs-s2/s2-pro-q2_K.gguf \
-  --tokenizer /home/rodrigo/Documentos/ggufs-s2/tokenizer.json \
+  --model /path/to/ggufs-s2/s2-pro-q2_K.gguf \
+  --tokenizer /path/to/ggufs-s2/tokenizer.json \
   --backend vulkan \
   --gpu-device 0 \
   --threads 8 \
   --max-tokens 64 \
-  --text "Primeira frase. Segunda frase maior para confirmar a pausa." \
+  --text "First sentence. A longer second sentence to confirm the pause." \
   --streaming \
   --segment-sentences \
   --sentence-pause-ms 180 \
-  --voice /home/rodrigo/Documentos/s2.cpp-correcoes/voices/hope.s2voice \
+  --voice /path/to/voices/hope.s2voice \
   --play-only \
   --log-level 2
 ```
@@ -221,7 +221,7 @@ python3 examples/python/ctypes_export_api.py \
 You can also load the same voice by id instead of by path:
 
 ```bash
---voice hope --voice-dir /home/rodrigo/Documentos/s2.cpp-correcoes/voices
+--voice hope --voice-dir /path/to/voices
 ```
 
 Updated native C# P/Invoke example: [`examples/csharp`](examples/csharp) contains a current sample project that binds every exported symbol, including `InitializeS2PipelineFromFiles()`, `S2SynthesizeStreaming()`, and `S2SynthesizeStreamingEx()` with low-latency, sentence segmentation, and saved `.s2voice` selection. Its local README also compares the current API surface against the original modular design proposed by SubSpecs.
@@ -451,7 +451,7 @@ curl -X POST http://127.0.0.1:3030/generate \
 # With a saved .s2voice profile
 curl -X POST http://127.0.0.1:3030/generate \
   --form "voice=hope" \
-  --form "text=Texto em portugues com a voz Hope." \
+  --form "text=English text using the Hope voice." \
   --form 'params={"stream":true,"chunked":true,"output_format":"pcm_s16le","segment_sentences":true,"stream_start_buffer_ms":6000,"max_new_tokens":512}' \
 | ffplay -autoexit -nodisp -infbuf -f s16le -ar 44100 -ac 1 -
 

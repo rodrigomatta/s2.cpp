@@ -18,6 +18,7 @@
 #include <cstring>
 #include <cstdio>
 #include <limits>
+#include <new>
 #include <stdexcept>
 
 namespace s2 {
@@ -40,6 +41,23 @@ struct transformer_inputs {
     ggml_tensor * mask      = nullptr;
     std::vector<int32_t> position_values;
     std::vector<float>   mask_values;
+};
+
+struct codec_decode_cache {
+    int32_t n_frames = 0;
+    int32_t n_samples = 0;
+    int32_t failed_n_frames = 0;
+    size_t ctx_size = 0;
+
+    std::vector<uint8_t> ctx_buf;
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * graph = nullptr;
+    ggml_gallocr_t allocr = nullptr;
+
+    std::vector<ggml_tensor *> code_id_tensors;
+    transformer_inputs inp;
+    ggml_tensor * audio = nullptr;
+    std::vector<int32_t> sanitized_codes;
 };
 
 struct AudioCodec::Impl {
@@ -83,6 +101,8 @@ struct AudioCodec::Impl {
 
     vq_cache semantic_vq;
     std::vector<vq_cache> residual_vq;
+
+    codec_decode_cache decode_cache;
 };
 
 static const char * backend_type_name(BackendType backend_type) {
@@ -95,7 +115,25 @@ static const char * backend_type_name(BackendType backend_type) {
     return "Unknown";
 }
 
+static void reset_decode_cache(codec_decode_cache & cache, bool preserve_failed_n_frames = true) {
+    if (cache.allocr) {
+        ggml_gallocr_free(cache.allocr);
+        cache.allocr = nullptr;
+    }
+    if (cache.ctx) {
+        ggml_free(cache.ctx);
+        cache.ctx = nullptr;
+    }
+
+    const int32_t failed_n_frames = cache.failed_n_frames;
+    cache = codec_decode_cache();
+    if (preserve_failed_n_frames) {
+        cache.failed_n_frames = failed_n_frames;
+    }
+}
+
 static void reset_codec_impl(AudioCodec::Impl & impl) {
+    reset_decode_cache(impl.decode_cache, false);
     if (impl.model_buf) {
         ggml_backend_buffer_free(impl.model_buf);
         impl.model_buf = nullptr;
@@ -646,6 +684,12 @@ const char * AudioCodec::backend_name() const {
     return ggml_backend_name(impl_->backend);
 }
 
+void AudioCodec::clear_decode_cache() {
+    if (impl_) {
+        reset_decode_cache(impl_->decode_cache, false);
+    }
+}
+
 bool AudioCodec::load_shared(SlowARModel* Model, gguf_context * shared_gguf_ctx, const std::string & gguf_path, int32_t gpu_device, BackendType backend_type) {
     if (!impl_) {
         impl_ = new Impl();
@@ -705,7 +749,6 @@ bool AudioCodec::load_shared(SlowARModel* Model, gguf_context * shared_gguf_ctx,
 
     if(!Model)
     {
-        //This WILL load the entire model weights AGAIN, x2'ing the VRAM req.
         struct gguf_init_params params = { true, &impl_->ctx_w };
         gguf_context * local_gguf = gguf_init_from_file(gguf_path.c_str(), params);
         if (!local_gguf) {
@@ -716,7 +759,7 @@ bool AudioCodec::load_shared(SlowARModel* Model, gguf_context * shared_gguf_ctx,
 
         gguf_free(local_gguf);
     }
-    else { impl_->ctx_w = Model->weights_.ctx_w; } //Share the model weights, save VRAM space!
+    else { impl_->ctx_w = Model->weights_.ctx_w; }
 
     gguf_context * gguf_ctx = shared_gguf_ctx;
 
@@ -1114,9 +1157,153 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
     return true;
 }
 
+static int32_t clamp_decode_code(int32_t code, int32_t codebook_size) {
+    if (code < 0) {
+        return 0;
+    }
+    if (code >= codebook_size) {
+        return codebook_size - 1;
+    }
+    return code;
+}
+
+static void sanitize_decode_codes(AudioCodec::Impl & impl, const int32_t * codes, int32_t n_frames,
+                                  std::vector<int32_t> & sanitized_codes) {
+    const int32_t num_codebooks = impl.quantizer_residual_codebooks + 1;
+    sanitized_codes.resize(static_cast<size_t>(num_codebooks) * n_frames);
+
+    for (int32_t t = 0; t < n_frames; ++t) {
+        sanitized_codes[static_cast<size_t>(t)] =
+            clamp_decode_code(codes[t], impl.quantizer_semantic_codebook_size);
+    }
+    for (int32_t cb = 0; cb < impl.quantizer_residual_codebooks; ++cb) {
+        const size_t src_offset = static_cast<size_t>(cb + 1) * n_frames;
+        const size_t dst_offset = static_cast<size_t>(cb + 1) * n_frames;
+        for (int32_t t = 0; t < n_frames; ++t) {
+            sanitized_codes[dst_offset + static_cast<size_t>(t)] =
+                clamp_decode_code(codes[src_offset + static_cast<size_t>(t)],
+                                  impl.quantizer_residual_codebook_size);
+        }
+    }
+}
+
+static bool build_cached_decode_graph(AudioCodec::Impl & impl, int32_t n_frames) {
+    codec_decode_cache & cache = impl.decode_cache;
+    reset_decode_cache(cache);
+
+    cache.ctx_size = 256u * 1024u * 1024u;
+    try {
+        cache.ctx_buf.resize(cache.ctx_size);
+    } catch (const std::bad_alloc &) {
+        cache.failed_n_frames = n_frames;
+        reset_decode_cache(cache);
+        return false;
+    }
+    ggml_init_params p = { cache.ctx_size, cache.ctx_buf.data(), true };
+    cache.ctx = ggml_init(p);
+    if (!cache.ctx) {
+        cache.failed_n_frames = n_frames;
+        reset_decode_cache(cache);
+        return false;
+    }
+
+    const int32_t num_codebooks = impl.quantizer_residual_codebooks + 1;
+    cache.code_id_tensors.resize(static_cast<size_t>(num_codebooks));
+    for (int32_t cb = 0; cb < num_codebooks; ++cb) {
+        cache.code_id_tensors[static_cast<size_t>(cb)] =
+            ggml_new_tensor_1d(cache.ctx, GGML_TYPE_I32, n_frames);
+    }
+
+    try {
+        ggml_tensor * stage = build_decode_codes_stage_backend(cache.ctx, impl, cache.code_id_tensors);
+        ggml_tensor * latent = build_quantizer_decode_stage(cache.ctx, impl, stage, cache.inp);
+        ggml_tensor * audio = build_decoder(cache.ctx, impl, latent);
+        cache.audio = ggml_cpy(cache.ctx, audio,
+                               ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32,
+                                                  audio->ne[0], audio->ne[1]));
+    } catch (const std::exception &) {
+        cache.failed_n_frames = n_frames;
+        reset_decode_cache(cache);
+        return false;
+    }
+
+    cache.graph = ggml_new_graph_custom(cache.ctx, 262144, false);
+    if (!cache.graph) {
+        cache.failed_n_frames = n_frames;
+        reset_decode_cache(cache);
+        return false;
+    }
+    ggml_build_forward_expand(cache.graph, cache.audio);
+
+    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl.backend));
+    if (!cache.allocr || !ggml_gallocr_alloc_graph(cache.allocr, cache.graph)) {
+        cache.failed_n_frames = n_frames;
+        reset_decode_cache(cache);
+        return false;
+    }
+
+    cache.n_frames = n_frames;
+    cache.n_samples = static_cast<int32_t>(ggml_nelements(cache.audio));
+    return true;
+}
+
+static bool run_cached_decode_graph(AudioCodec::Impl & impl, const int32_t * codes, int32_t n_frames,
+                                    int32_t n_threads, std::vector<float> & audio_out) {
+    codec_decode_cache & cache = impl.decode_cache;
+    if (cache.failed_n_frames == n_frames) {
+        return false;
+    }
+    if (!cache.ctx || cache.n_frames != n_frames) {
+        if (!build_cached_decode_graph(impl, n_frames)) {
+            return false;
+        }
+    }
+
+    sanitize_decode_codes(impl, codes, n_frames, cache.sanitized_codes);
+
+    const int32_t num_codebooks = impl.quantizer_residual_codebooks + 1;
+    for (int32_t cb = 0; cb < num_codebooks; ++cb) {
+        ggml_backend_tensor_set(
+            cache.code_id_tensors[static_cast<size_t>(cb)],
+            cache.sanitized_codes.data() + static_cast<size_t>(cb) * n_frames,
+            0,
+            static_cast<size_t>(n_frames) * sizeof(int32_t));
+    }
+    if (cache.inp.positions) {
+        ggml_backend_tensor_set(cache.inp.positions, cache.inp.position_values.data(), 0,
+            cache.inp.position_values.size() * sizeof(int32_t));
+    }
+    if (cache.inp.mask) {
+        ggml_backend_tensor_set(cache.inp.mask, cache.inp.mask_values.data(), 0,
+            cache.inp.mask_values.size() * sizeof(float));
+    }
+
+    if (ggml_backend_is_cpu(impl.backend)) {
+        ggml_backend_cpu_set_n_threads(impl.backend, n_threads);
+    }
+
+    if (ggml_backend_graph_compute(impl.backend, cache.graph) != GGML_STATUS_SUCCESS) {
+        cache.failed_n_frames = n_frames;
+        reset_decode_cache(cache);
+        return false;
+    }
+
+    audio_out.resize(static_cast<size_t>(cache.n_samples));
+    ggml_backend_tensor_get(cache.audio, audio_out.data(), 0,
+                            static_cast<size_t>(cache.n_samples) * sizeof(float));
+    return true;
+}
+
 bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threads, 
                          std::vector<float> & audio_out) {
     if (n_frames <= 0) return false;
+    if (!impl_ || !impl_->backend) return false;
+
+    if (!ggml_backend_is_cpu(impl_->backend) &&
+        run_cached_decode_graph(*impl_, codes, n_frames, n_threads, audio_out)) {
+        return true;
+    }
+
     int32_t latent_frames = 0;
     std::vector<float> latent_out;
     {
