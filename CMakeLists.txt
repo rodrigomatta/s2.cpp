@@ -19,6 +19,13 @@ if(S2_METAL AND NOT APPLE)
     message(FATAL_ERROR "S2_METAL is only supported on Apple platforms.")
 endif()
 
+# MSVC provides math functions through the CRT and does not ship a separate
+# libm. Some ggml CMake revisions still probe for "m" and can propagate
+# MATH_LIBRARY-NOTFOUND into the generated Visual Studio linker inputs.
+if(MSVC)
+    set(MATH_LIBRARY "" CACHE FILEPATH "MSVC does not require a separate math library." FORCE)
+endif()
+
 set(GGML_BUILD_TESTS  OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
