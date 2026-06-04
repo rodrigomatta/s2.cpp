@@ -116,7 +116,7 @@ endif()
 if(S2_METAL)
     target_compile_definitions(${target_name} PRIVATE GGML_USE_METAL)
 endif()
-if(S2_HIP OR GGML_HIP)
+if(S2_HIP)
     target_compile_definitions(${target_name} PRIVATE GGML_USE_CUDA)
 endif()
 
