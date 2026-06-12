@@ -747,7 +747,7 @@ bool AudioCodec::load_shared(SlowARModel* Model, gguf_context * shared_gguf_ctx,
         return false;
     }
 
-    if(!Model)
+    if(!Model || !shared_gguf_ctx)
     {
         struct gguf_init_params params = { true, &impl_->ctx_w };
         gguf_context * local_gguf = gguf_init_from_file(gguf_path.c_str(), params);
@@ -762,6 +762,17 @@ bool AudioCodec::load_shared(SlowARModel* Model, gguf_context * shared_gguf_ctx,
     else { impl_->ctx_w = Model->weights_.ctx_w; }
 
     gguf_context * gguf_ctx = shared_gguf_ctx;
+    gguf_context * local_codec_gguf = nullptr;
+    if (!gguf_ctx && !gguf_path.empty()) {
+        struct gguf_init_params lparams = { true, nullptr };
+        local_codec_gguf = gguf_init_from_file(gguf_path.c_str(), lparams);
+        if (!local_codec_gguf) {
+            std::cerr << "[Codec] Failed to open GGUF for metadata: " << gguf_path << std::endl;
+            reset_codec_impl(*impl_);
+            return false;
+        }
+        gguf_ctx = local_codec_gguf;
+    }
 
     try {
         auto req_str = [&](const char * k) -> std::string {
@@ -880,9 +891,11 @@ bool AudioCodec::load_shared(SlowARModel* Model, gguf_context * shared_gguf_ctx,
         impl_->residual_vq.clear();
     } catch (const std::exception & e) {
         std::cerr << "[Codec] " << e.what() << std::endl;
+        if (local_codec_gguf) gguf_free(local_codec_gguf);
         reset_codec_impl(*impl_);
         return false;
     }
+    if (local_codec_gguf) gguf_free(local_codec_gguf);
     S2_LOG_INFO_STREAM("[Codec] Backend: " << backend_name() << std::endl);
     return true;
 }
