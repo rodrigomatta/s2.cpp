@@ -26,6 +26,7 @@ public:
 
 struct PipelineParams {
     std::string model_path;
+    std::string codec_model_path;
     std::string tokenizer_path;
     std::string text;
     std::string prompt_text;

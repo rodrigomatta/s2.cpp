@@ -477,7 +477,11 @@ bool Pipeline::init(const PipelineParams & params) {
             safe_print_ln("Pipeline: loading codec on " + backend_label +
                           " device " + std::to_string(codec_gpu_device) + "...");
         }
-        codec_loaded = codec().load_shared(&model(), shared_gguf, params.model_path, codec_gpu_device, codec_backend_type);
+        if (!params.codec_model_path.empty()) {
+            codec_loaded = codec().load_shared(&model(), nullptr, params.codec_model_path, codec_gpu_device, codec_backend_type);
+        } else {
+            codec_loaded = codec().load_shared(&model(), shared_gguf, params.model_path, codec_gpu_device, codec_backend_type);
+        }
         if (!codec_loaded) {
             if (codec_backend_type == BackendType::Metal) {
                 safe_print_warn_ln(
@@ -495,18 +499,42 @@ bool Pipeline::init(const PipelineParams & params) {
         if (!use_gpu_codec) {
             safe_print_ln("Pipeline: loading codec on CPU.");
         }
-        codec_loaded = codec().load_shared(&model(), shared_gguf, params.model_path, -1, BackendType::CPU);
+        if (!params.codec_model_path.empty()) {
+            codec_loaded = codec().load_shared(&model(), nullptr, params.codec_model_path, -1, BackendType::CPU);
+        } else {
+            codec_loaded = codec().load_shared(&model(), shared_gguf, params.model_path, -1, BackendType::CPU);
+        }
     }
     if (!codec_loaded) {
-        safe_print_error_ln("Pipeline error: could not load codec from " + params.model_path);
+        std::string codec_src = params.codec_model_path.empty() ? params.model_path : params.codec_model_path;
+        safe_print_error_ln("Pipeline error: could not load codec from " + codec_src);
         gguf_free(shared_gguf);
         return false;
     }
 
-    if (!read_all_tensor_data(params.model_path, shared_gguf, model(), codec())) {
-        safe_print_error_ln("Pipeline error: failed to read tensor data from " + params.model_path);
-        gguf_free(shared_gguf);
-        return false;
+    {
+        bool model_data_ok = read_all_tensor_data(params.model_path, shared_gguf, model(), codec());
+        if (!model_data_ok) {
+            safe_print_error_ln("Pipeline error: failed to read tensor data from " + params.model_path);
+            gguf_free(shared_gguf);
+            return false;
+        }
+    }
+
+    if (!params.codec_model_path.empty()) {
+        gguf_context * codec_gguf = gguf_init_from_file(params.codec_model_path.c_str(), gguf_params);
+        if (!codec_gguf) {
+            safe_print_error_ln("Pipeline error: failed to open codec GGUF from " + params.codec_model_path);
+            gguf_free(shared_gguf);
+            return false;
+        }
+        bool codec_data_ok = read_all_tensor_data(params.codec_model_path, codec_gguf, model(), codec());
+        gguf_free(codec_gguf);
+        if (!codec_data_ok) {
+            safe_print_error_ln("Pipeline error: failed to read codec tensor data from " + params.codec_model_path);
+            gguf_free(shared_gguf);
+            return false;
+        }
     }
 
     gguf_free(shared_gguf);

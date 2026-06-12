@@ -87,7 +87,8 @@ void print_uso() {
     safe_print("  --trim-silence              Trim trailing silence in output WAV\n");
     safe_print("  --no-normalize              Keep original output peak level\n");
     safe_print("  --normalize                 Peak-normalize output WAV to 0.95\n");
-    safe_print("  --codec-auto                Benchmark codec backends and keep the fastest (default)\n");
+    safe_print(" --codec-model <path> Path to separate codec GGUF (split model files)\n");
+    safe_print(" --codec-auto Benchmark codec backends and keep the fastest (default)\n");
     safe_print("  --codec-follow-backend      Force codec to follow the selected GPU backend\n");
     safe_print("  --codec-cpu                 Force codec on CPU even when model uses GPU\n");
     safe_print("  --stream-file               Write output WAV through the streaming path\n");
@@ -194,7 +195,8 @@ int main(int argc, char** argv) {
         else if (arg == "--normalize")        { params.normalize_output = true;  }
         else if (arg == "--codec-auto")       { params.codec_auto_backend = true;  params.codec_follow_backend = true;  }
         else if (arg == "--codec-follow-backend") { params.codec_auto_backend = false; params.codec_follow_backend = true; }
-        else if (arg == "--codec-cpu")        { params.codec_auto_backend = false; params.codec_follow_backend = false; }
+        else if (arg == "--codec-cpu") { params.codec_auto_backend = false; params.codec_follow_backend = false; }
+        else if (arg == "--codec-model") { if (i+1 < argc) params.codec_model_path = argv[++i]; }
         else if (arg == "--stream-file")      { use_stream_file = true; }
         else if (arg == "--stream-decode-stride") {
             if (i+1 < argc) {
