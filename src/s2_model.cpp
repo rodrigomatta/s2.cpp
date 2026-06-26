@@ -18,12 +18,6 @@
 
 namespace s2 {
 
-static int32_t resolve_n_threads(int32_t n_threads) {
-    if (n_threads > 0) return n_threads;
-    const auto hw = std::thread::hardware_concurrency();
-    return static_cast<int32_t>(hw > 0 ? hw : 4);
-}
-
 static const char * backend_type_name(BackendType backend_type) {
     switch (backend_type) {
         case BackendType::CPU:    return "CPU";

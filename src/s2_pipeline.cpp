@@ -844,7 +844,7 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
     PromptTensor prompt = build_prompt(
         tokenizer(), params.text, params.prompt_text,
         ref_codes,
-        num_codebooks, T_prompt);
+        num_codebooks, T_prompt, params.instruction);
 
     int32_t max_seq_len = prompt.cols + params.gen.max_new_tokens;
     const auto kv_t0 = std::chrono::steady_clock::now();
@@ -863,14 +863,23 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         return false;
     }
 
+    // Offline synthesis has every frame in hand, so there is no latency reason
+    // to chunk the codec decode. Decoding all frames in a single pass is both
+    // faster (one graph build / allocation instead of one per window, and no
+    // re-decoding of the overlapping history region) and cleaner (no window
+    // boundary artifacts). Streaming uses the windowed path; offline defaults to
+    // a single shot unless the user explicitly sets a decode stride.
+    const bool user_set_stride = params.stream_decode_stride_frames > 0;
     const int32_t offline_decode_stride_frames =
-        params.stream_decode_stride_frames > 0 ? params.stream_decode_stride_frames : 16;
+        user_set_stride ? params.stream_decode_stride_frames : res.n_frames;
+    const int32_t offline_decode_context_frames =
+        user_set_stride ? params.codec_decode_context_frames : 0;
     double decode_ms = 0.0;
     int32_t decode_batches = 0;
     const auto decode_t0 = std::chrono::steady_clock::now();
     if (!decode_codes_windowed(codec(), res.codes.data(), res.n_frames, num_codebooks,
                                params.gen.n_threads, offline_decode_stride_frames,
-                               params.codec_decode_context_frames,
+                               offline_decode_context_frames,
                                audio_out, &decode_ms, &decode_batches)) {
         safe_print_error_ln("Pipeline error: decode failed.");
         return false;
@@ -982,7 +991,7 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
     PromptTensor prompt = build_prompt(
         tokenizer(), params.text, params.prompt_text,
         ref_codes,
-        num_codebooks, T_prompt);
+        num_codebooks, T_prompt, params.instruction);
 
     int32_t max_seq_len = prompt.cols + params.gen.max_new_tokens;
     const auto kv_t0 = std::chrono::steady_clock::now();

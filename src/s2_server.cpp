@@ -577,6 +577,10 @@ namespace s2
                             voice_dir_value = j["voice_dir"].get<std::string>();
                         }
 
+                        if (j.contains("instruction")) {
+                            pipelineParams.instruction = j["instruction"].get<std::string>();
+                        }
+
                         if (j.contains("stream_decode_stride_frames")) {
                             int32_t val = j["stream_decode_stride_frames"].get<int32_t>();
                             pipelineParams.stream_decode_stride_frames = std::max(0, val);

@@ -29,6 +29,17 @@ endif()
 set(GGML_BUILD_TESTS  OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
+# Enable link-time optimization for optimized builds. ggml ships GGML_LTO=OFF
+# by default; turning it on gives a few percent on the CPU compute kernels at
+# no correctness cost. Only meaningful for optimized configs, and only if not
+# already set by the user.
+if(NOT DEFINED GGML_LTO AND
+   (CMAKE_BUILD_TYPE STREQUAL "Release" OR
+    CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo" OR
+    CMAKE_BUILD_TYPE STREQUAL "MinSizeRel"))
+    set(GGML_LTO ON CACHE BOOL "" FORCE)
+endif()
+
 if(S2_AUTO_APPLY_LOCAL_PATCHES)
 
 	if(WIN32)

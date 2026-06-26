@@ -8,7 +8,8 @@ PromptTensor build_prompt(
     const std::string & prompt_text,
     const int32_t * prompt_codes,
     int32_t num_codebooks,
-    int32_t T_prompt
+    int32_t T_prompt,
+    const std::string & instruction
 ) {
     PromptTensor result;
     result.rows = num_codebooks + 1;
@@ -33,7 +34,11 @@ PromptTensor build_prompt(
 
         app(sys_pre, tokenizer.encode("<|im_start|>system"));
         app(sys_pre, NEWLINE);
-        app(sys_pre, tokenizer.encode("convert the provided text to speech reference to the following:\n\nText:\n"));
+        std::string sys_msg = "convert the provided text to speech reference to the following:\n\nText:\n";
+        if (!instruction.empty()) {
+            sys_msg = instruction + "\n\n" + sys_msg;
+        }
+        app(sys_pre, tokenizer.encode(sys_msg));
         if (!prompt_has_speaker_tag) {
             app(sys_pre, tokenizer.encode("<|speaker:0|>"));
         }
@@ -57,7 +62,11 @@ PromptTensor build_prompt(
 
         app(sys_post, tokenizer.encode("<|im_start|>system"));
         app(sys_post, NEWLINE);
-        app(sys_post, tokenizer.encode("convert the provided text to speech"));
+        std::string sys_msg = "convert the provided text to speech";
+        if (!instruction.empty()) {
+            sys_msg += ". " + instruction;
+        }
+        app(sys_post, tokenizer.encode(sys_msg));
         app(sys_post, { im_end_id });
         app(sys_post, NEWLINE);
 

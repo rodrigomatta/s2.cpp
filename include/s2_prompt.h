@@ -20,7 +20,8 @@ PromptTensor build_prompt(
     const std::string & prompt_text,
     const int32_t * prompt_codes,
     int32_t num_codebooks,
-    int32_t T_prompt
+    int32_t T_prompt,
+    const std::string & instruction = ""
 );
 
 }

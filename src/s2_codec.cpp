@@ -1046,7 +1046,7 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
                                 enc_inp.mask_values.size() * sizeof(float));
     }
 
-    if (ggml_backend_is_cpu(impl_->backend)) ggml_backend_cpu_set_n_threads(impl_->backend, n_threads);
+    if (ggml_backend_is_cpu(impl_->backend)) ggml_backend_cpu_set_n_threads(impl_->backend, resolve_n_threads(n_threads));
     if (ggml_backend_graph_compute(impl_->backend, gf) != GGML_STATUS_SUCCESS) {
         std::cerr << "[Codec::encode] encoder compute failed." << std::endl;
         ggml_gallocr_free(allocr);
@@ -1119,7 +1119,7 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
                                     qenc_inp.mask_values.size() * sizeof(float));
         }
 
-        if (ggml_backend_is_cpu(impl_->backend)) ggml_backend_cpu_set_n_threads(impl_->backend, n_threads);
+        if (ggml_backend_is_cpu(impl_->backend)) ggml_backend_cpu_set_n_threads(impl_->backend, resolve_n_threads(n_threads));
         if (ggml_backend_graph_compute(impl_->backend, gf2) != GGML_STATUS_SUCCESS) {
             std::cerr << "[Codec::encode] quantizer stage compute failed." << std::endl;
             ggml_gallocr_free(allocr2);
@@ -1279,7 +1279,7 @@ static bool run_cached_decode_graph(AudioCodec::Impl & impl, const int32_t * cod
     }
 
     if (ggml_backend_is_cpu(impl.backend)) {
-        ggml_backend_cpu_set_n_threads(impl.backend, n_threads);
+        ggml_backend_cpu_set_n_threads(impl.backend, resolve_n_threads(n_threads));
     }
 
     if (ggml_backend_graph_compute(impl.backend, cache.graph) != GGML_STATUS_SUCCESS) {
@@ -1381,7 +1381,7 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
                 inp.mask_values.size() * sizeof(float));
         }
 
-        if (ggml_backend_is_cpu(impl_->backend)) ggml_backend_cpu_set_n_threads(impl_->backend, n_threads);
+        if (ggml_backend_is_cpu(impl_->backend)) ggml_backend_cpu_set_n_threads(impl_->backend, resolve_n_threads(n_threads));
 
         if (ggml_backend_graph_compute(impl_->backend, gf) != GGML_STATUS_SUCCESS) {
             std::cerr << "[Codec::decode] quantizer decode compute failed." << std::endl;
@@ -1426,7 +1426,7 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
 
     ggml_backend_tensor_set(latent_in, latent_out.data(), 0, latent_out.size() * sizeof(float));
 
-    if (ggml_backend_is_cpu(impl_->backend)) ggml_backend_cpu_set_n_threads(impl_->backend, n_threads);
+    if (ggml_backend_is_cpu(impl_->backend)) ggml_backend_cpu_set_n_threads(impl_->backend, resolve_n_threads(n_threads));
 
     if (ggml_backend_graph_compute(impl_->backend, gf) != GGML_STATUS_SUCCESS) {
             std::cerr << "[Codec::decode] decoder compute failed." << std::endl;

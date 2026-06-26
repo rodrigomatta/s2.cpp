@@ -66,6 +66,7 @@ void print_uso() {
     safe_print("  -text, --text      <text>   Text to synthesize\n");
     safe_print("  -pa, --prompt-audio <path>  Path to reference audio for cloning\n");
     safe_print("  -pt, --prompt-text <text>   Text of the reference audio\n");
+    safe_print("  --instruction      <text>   Natural language instruction to control speaking style\n");
     safe_print("  --voice            <id>     Load a saved voice profile\n");
     safe_print("  --save-voice                Save the encoded reference as a voice profile\n");
     safe_print("  --voice-dir        <path>   Directory used for saved voice profiles\n");
@@ -160,6 +161,7 @@ int main(int argc, char** argv) {
         else if (arg == "-text" || arg == "--text")       { if (i+1 < argc) params.text               = argv[++i]; }
         else if (arg == "-pa" || arg == "--prompt-audio") { if (i+1 < argc) params.prompt_audio_path = argv[++i]; }
         else if (arg == "-pt" || arg == "--prompt-text")  { if (i+1 < argc) params.prompt_text        = argv[++i]; }
+        else if (arg == "--instruction")                  { if (i+1 < argc) params.instruction         = argv[++i]; }
         else if (arg == "--voice")                        { if (i+1 < argc) params.voice_id           = argv[++i]; }
         else if (arg == "--save-voice")                   { params.save_voice = true; }
         else if (arg == "--voice-dir")                    { if (i+1 < argc) params.voice_storage_dir  = argv[++i]; }

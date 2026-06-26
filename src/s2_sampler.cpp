@@ -1,6 +1,7 @@
 #include "../include/s2_sampler.h"
 #include <cmath>
 #include <algorithm>
+#include <limits>
 #include <random>
 
 namespace s2 {
@@ -22,50 +23,58 @@ static void apply_softmax(std::vector<float> & probs, float temp = 1.0f) {
     }
 }
 
-static std::vector<float> softmax_from_sorted_logits(const std::vector<std::pair<float, int32_t>> & items) {
-    std::vector<float> probs(items.size(), 0.0f);
-    if (items.empty()) return probs;
-
-    const float max_val = items.front().first;
-    float sum = 0.0f;
-    for (size_t i = 0; i < items.size(); ++i) {
-        probs[i] = std::exp(items[i].first - max_val);
-        sum += probs[i];
-    }
-
-    if (sum > 0.0f) {
-        for (float & p : probs) p /= sum;
-    }
-    return probs;
-}
-
 int32_t sample_token(const float * logits, int32_t vocab_size, const SamplerParams & params) {
     if (vocab_size <= 0) return 0;
 
+    const int32_t k     = params.top_k > 0 ? std::min(params.top_k, vocab_size) : vocab_size;
+    const float   top_p = std::clamp(params.top_p, 0.0f, 1.0f);
+    const float   NEG_INF = -std::numeric_limits<float>::infinity();
+
+    // Single pass: gather finite candidates and the global max. Masked logits
+    // (set to -inf by the caller, e.g. the semantic mask covering ~95% of the
+    // vocab) contribute exp(-inf)=0 to the softmax and can never be selected,
+    // so skipping them is exact and avoids building/sorting the full vocab.
     std::vector<std::pair<float, int32_t>> items;
-    items.reserve(vocab_size);
+    items.reserve(static_cast<size_t>(std::min(vocab_size, 8192)));
+    float max_val = NEG_INF;
     for (int32_t i = 0; i < vocab_size; ++i) {
-        items.push_back({logits[i], i});
+        const float v = logits[i];
+        if (v == NEG_INF) continue;
+        items.push_back({v, i});
+        if (v > max_val) max_val = v;
+    }
+    if (items.empty()) return 0;
+
+    // Full partition function over the finite candidates. This matches the
+    // original code's denominator (the -inf terms it summed were exactly 0),
+    // so the top_p cumulative mass below is computed identically.
+    float Z = 0.0f;
+    for (const auto & it : items) Z += std::exp(it.first - max_val);
+    if (!(Z > 0.0f)) Z = 1.0f;
+
+    // Order by logit descending, breaking ties by index for determinism.
+    auto cmp = [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
+        if (a.first != b.first) return a.first > b.first;
+        return a.second < b.second;
+    };
+    const int32_t kk = std::min<int32_t>(k, static_cast<int32_t>(items.size()));
+    if (kk < static_cast<int32_t>(items.size())) {
+        // top_k is small (default 30); only the top kk elements are ever kept,
+        // so a partial sort (O(n log kk)) replaces a full sort (O(n log n)).
+        std::partial_sort(items.begin(), items.begin() + kk, items.end(), cmp);
+        items.resize(kk);
+    } else {
+        std::sort(items.begin(), items.end(), cmp);
     }
 
-    std::sort(items.begin(), items.end(), [](const auto & a, const auto & b) {
-        return a.first > b.first;
-    });
-
-    const int32_t k = params.top_k > 0 ? std::min(params.top_k, vocab_size) : vocab_size;
-    const float top_p = std::clamp(params.top_p, 0.0f, 1.0f);
-    const std::vector<float> sorted_probs = softmax_from_sorted_logits(items);
-
+    // Keep the prefix up to top_k and the top_p cumulative-probability cutoff.
     std::vector<std::pair<float, int32_t>> filtered;
-    filtered.reserve(k);
-
+    filtered.reserve(items.size());
     float cumsum = 0.0f;
     for (int32_t i = 0; i < (int32_t)items.size(); ++i) {
-        cumsum += sorted_probs[i];
-        const bool remove_for_top_k = (i >= k);
-        const bool remove_for_top_p = (i > 0 && cumsum > top_p);
-        if (remove_for_top_k || remove_for_top_p) {
-            continue;
+        cumsum += std::exp(items[i].first - max_val) / Z;
+        if (i > 0 && cumsum > top_p) {
+            break; // cumsum is monotonic, so every later item also exceeds top_p
         }
         filtered.push_back(items[i]);
     }

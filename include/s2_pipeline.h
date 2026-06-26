@@ -31,6 +31,7 @@ struct PipelineParams {
     std::string prompt_text;
     std::string prompt_audio_path;
     std::string output_path;
+    std::string instruction;
     GenerateParams gen;
     int32_t gpu_device = -1;
     BackendType backend_type = BackendType::CPU;
