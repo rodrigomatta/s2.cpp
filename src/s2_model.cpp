@@ -815,14 +815,45 @@ bool SlowARModel::prefill(const std::vector<int32_t> & flat_tokens, int32_t n_to
             backend_requires_single_token_semantic_prefill(backend_gpu_)) {
             chunk_tokens = 1;
         } else {
-
-            const int32_t adaptive_gpu_chunk = std::clamp(
-                128 / std::max(1, n_gpu_layers_),
-                8,
-                64
-            );
-            if (n_tokens > adaptive_gpu_chunk) {
-                chunk_tokens = adaptive_gpu_chunk;
+            // Backend-specific prefill chunk sizes for naive attention path.
+            // Vulkan: Limited by ggml_soft_max shader workgroup/shared memory limits
+            // CUDA/Metal: Highly optimized soft_max kernels handle large batches
+            // CPU: Memory bandwidth bound, scale with available parallelism
+            int32_t adaptive_chunk = std::min<int32_t>(256, std::max<int32_t>(64, resolve_n_threads(n_threads) * 16));
+        
+            if (backend_gpu_ != nullptr && n_gpu_layers_ > 0) {
+                const char * backend_name = ggml_backend_name(backend_gpu_);
+                if (backend_name != nullptr) {
+                    std::string name(backend_name);
+                    if (name.find("CUDA") != std::string::npos ||
+                        name.find("Metal") != std::string::npos) {
+                        adaptive_chunk = 512;
+                    } else if (name.find("Vulkan") != std::string::npos) {
+                        adaptive_chunk = 64;
+                    }
+                }
+        
+                int32_t semantic_prompt_tokens = 0;
+                for (int32_t t = 0; t < n_tokens; ++t) {
+                    const int32_t semantic = flat_tokens[static_cast<size_t>(t) * codebook_dim];
+                    if (semantic >= hparams_.semantic_begin_id &&
+                        semantic <= hparams_.semantic_end_id) {
+                        semantic_prompt_tokens++;
+                        if (semantic_prompt_tokens > 1) {
+                            break;
+                        }
+                    }
+                }
+        
+                if (semantic_prompt_tokens > 1 &&
+                    backend_requires_single_token_semantic_prefill(backend_gpu_)) {
+                    adaptive_chunk = 1;
+                }
+            }
+        
+            int32_t chunk_tokens = n_tokens;
+            if (n_tokens > adaptive_chunk) {
+                chunk_tokens = adaptive_chunk;
             }
         }
     }
