@@ -73,7 +73,7 @@ void print_uso() {
     safe_print("  -o, --output       <path>   Output WAV path\n");
     safe_print("  -v, --vulkan     <id>   Vulkan device index (-1 = CPU)\n");
     safe_print("  -c, --cuda       <id>   CUDA device index (-1 = CPU)\n");
-    safe_print("  -M, --metal             Use Metal backend (macOS only)\n");
+    safe_print("  -mt, --metal             Use Metal backend (macOS only)\n");
     safe_print("  -ngl, --gpu-layers  <n>     Transformer layers on GPU (-1 = auto, 0 = CPU only)\n");
     safe_print("  -threads, --threads <n>     CPU threads (0 = auto)\n");
     safe_print("  -max-tokens, --max-tokens <n>  Max tokens to generate\n");
@@ -155,27 +155,35 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if      (arg == "-m"  || arg == "--model")        { if (i+1 < argc) params.model_path        = argv[++i]; }
-        else if (arg == "-t"  || arg == "--tokenizer")    { if (i+1 < argc) params.tokenizer_path    = argv[++i]; }
-        else if (arg == "-text" || arg == "--text")       { if (i+1 < argc) params.text               = argv[++i]; }
-        else if (arg == "-pa" || arg == "--prompt-audio") { if (i+1 < argc) params.prompt_audio_path = argv[++i]; }
-        else if (arg == "-pt" || arg == "--prompt-text")  { if (i+1 < argc) params.prompt_text        = argv[++i]; }
-        else if (arg == "--voice")                        { if (i+1 < argc) params.voice_id           = argv[++i]; }
-        else if (arg == "--save-voice")                   { params.save_voice = true; }
-        else if (arg == "--voice-dir")                    { if (i+1 < argc) params.voice_storage_dir  = argv[++i]; }
-        else if (arg == "--list-voices")                  { list_voices = true; }
-        else if (arg == "-o"  || arg == "--output")       { if (i+1 < argc) params.output_path        = argv[++i]; }
-        else if (arg == "-v"  || arg == "--vulkan")       { if (i+1 < argc) { try { params.gpu_device = std::stoi(argv[++i]); } catch(...) {} params.backend_type = s2::BackendType::Vulkan; } }
-        else if (arg == "-c"  || arg == "--cuda")         { if (i+1 < argc) { try { params.gpu_device = std::stoi(argv[++i]); } catch(...) {} params.backend_type = s2::BackendType::CUDA; } }
-        else if (arg == "-M"  || arg == "--metal")        { params.gpu_device = 0; params.backend_type = s2::BackendType::Metal; }
-        else if (arg == "-ngl" || arg == "--gpu-layers")  { if (i+1 < argc) { try { params.n_gpu_layers = std::stoi(argv[++i]); } catch(...) {} } }
-        else if (arg == "-threads" || arg == "--threads") { if (i+1 < argc) { try { params.gen.n_threads      = std::stoi(argv[++i]); } catch(...) {} } }
-        else if (arg == "-max-tokens" || arg == "--max-tokens") {
+        
+        // Normalize flag arguments to lowercase for case-insensitive matching
+        std::string arg_lower = arg;
+        if (!arg.empty() && arg[0] == '-') {
+            std::transform(arg_lower.begin(), arg_lower.end(), arg_lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        }
+
+        if      (arg_lower == "-m"  || arg_lower == "--model")        { if (i+1 < argc) params.model_path        = argv[++i]; }
+        else if (arg_lower == "-t"  || arg_lower == "--tokenizer")    { if (i+1 < argc) params.tokenizer_path    = argv[++i]; }
+        else if (arg_lower == "-text" || arg_lower == "--text")       { if (i+1 < argc) params.text               = argv[++i]; }
+        else if (arg_lower == "-pa" || arg_lower == "--prompt-audio") { if (i+1 < argc) params.prompt_audio_path = argv[++i]; }
+        else if (arg_lower == "-pt" || arg_lower == "--prompt-text")  { if (i+1 < argc) params.prompt_text        = argv[++i]; }
+        else if (arg_lower == "--voice")                              { if (i+1 < argc) params.voice_id           = argv[++i]; }
+        else if (arg_lower == "--save-voice")                         { params.save_voice = true; }
+        else if (arg_lower == "--voice-dir")                          { if (i+1 < argc) params.voice_storage_dir  = argv[++i]; }
+        else if (arg_lower == "--list-voices")                        { list_voices = true; }
+        else if (arg_lower == "-o"  || arg_lower == "--output")       { if (i+1 < argc) params.output_path        = argv[++i]; }
+        else if (arg_lower == "-v"  || arg_lower == "--vulkan")       { if (i+1 < argc) { try { params.gpu_device = std::stoi(argv[++i]); } catch(...) {} params.backend_type = s2::BackendType::Vulkan; } }
+        else if (arg_lower == "-c"  || arg_lower == "--cuda")         { if (i+1 < argc) { try { params.gpu_device = std::stoi(argv[++i]); } catch(...) {} params.backend_type = s2::BackendType::CUDA; } }
+        else if (arg_lower == "-mt"  || arg_lower == "--metal")       { params.gpu_device = 0; params.backend_type = s2::BackendType::Metal; }
+        else if (arg_lower == "-ngl" || arg_lower == "--gpu-layers")  { if (i+1 < argc) { try { params.n_gpu_layers = std::stoi(argv[++i]); } catch(...) {} } }
+        else if (arg_lower == "-threads" || arg_lower == "--threads") { if (i+1 < argc) { try { params.gen.n_threads      = std::stoi(argv[++i]); } catch(...) {} } }
+        else if (arg_lower == "-max-tokens" || arg_lower == "--max-tokens") {
             if (i+1 < argc) {
                 try { params.gen.max_new_tokens = std::stoi(argv[++i]); } catch(...) {}
             }
         }
-        else if (arg == "--min-tokens-before-end")        {
+        else if (arg_lower == "--min-tokens-before-end")        {
             if (i+1 < argc) {
                 try {
                     params.gen.min_tokens_before_end = std::stoi(argv[++i]);
@@ -183,25 +191,25 @@ int main(int argc, char** argv) {
                 } catch(...) {}
             }
         }
-        else if (arg == "-temp" || arg == "--temp" || arg == "--temperature") { if (i+1 < argc) { try { params.gen.temperature = std::stof(argv[++i]); } catch(...) {} } }
-        else if (arg == "-top-p" || arg == "--top-p")      { if (i+1 < argc) { try { params.gen.top_p       = std::stof(argv[++i]); } catch(...) {} } }
-        else if (arg == "-top-k" || arg == "--top-k")      { if (i+1 < argc) { try { params.gen.top_k       = std::stoi(argv[++i]); } catch(...) {} } }
-        else if (arg == "--dynamic-normalize")     { params.normalize_dynamic = true;  }
-        else if (arg == "--no-dynamic-normalize")  { params.normalize_dynamic = false; }
-        else if (arg == "--no-trim-silence")  { params.trim_silence     = false; }
-        else if (arg == "--trim-silence")     { params.trim_silence     = true;  }
-        else if (arg == "--no-normalize")     { params.normalize_output = false; }
-        else if (arg == "--normalize")        { params.normalize_output = true;  }
-        else if (arg == "--codec-auto")       { params.codec_auto_backend = true;  params.codec_follow_backend = true;  }
-        else if (arg == "--codec-follow-backend") { params.codec_auto_backend = false; params.codec_follow_backend = true; }
-        else if (arg == "--codec-cpu")        { params.codec_auto_backend = false; params.codec_follow_backend = false; }
-        else if (arg == "--stream-file")      { use_stream_file = true; }
-        else if (arg == "--stream-decode-stride") {
+        else if (arg_lower == "-temp" || arg_lower == "--temp" || arg_lower == "--temperature") { if (i+1 < argc) { try { params.gen.temperature = std::stof(argv[++i]); } catch(...) {} } }
+        else if (arg_lower == "-top-p" || arg_lower == "--top-p")      { if (i+1 < argc) { try { params.gen.top_p       = std::stof(argv[++i]); } catch(...) {} } }
+        else if (arg_lower == "-top-k" || arg_lower == "--top-k")      { if (i+1 < argc) { try { params.gen.top_k       = std::stoi(argv[++i]); } catch(...) {} } }
+        else if (arg_lower == "--dynamic-normalize")     { params.normalize_dynamic = true;  }
+        else if (arg_lower == "--no-dynamic-normalize")  { params.normalize_dynamic = false; }
+        else if (arg_lower == "--no-trim-silence")  { params.trim_silence     = false; }
+        else if (arg_lower == "--trim-silence")     { params.trim_silence     = true;  }
+        else if (arg_lower == "--no-normalize")     { params.normalize_output = false; }
+        else if (arg_lower == "--normalize")        { params.normalize_output = true;  }
+        else if (arg_lower == "--codec-auto")       { params.codec_auto_backend = true;  params.codec_follow_backend = true;  }
+        else if (arg_lower == "--codec-follow-backend") { params.codec_auto_backend = false; params.codec_follow_backend = true; }
+        else if (arg_lower == "--codec-cpu")        { params.codec_auto_backend = false; params.codec_follow_backend = false; }
+        else if (arg_lower == "--stream-file")      { use_stream_file = true; }
+        else if (arg_lower == "--stream-decode-stride") {
             if (i+1 < argc) {
                 try { params.stream_decode_stride_frames = std::stoi(argv[++i]); } catch(...) {}
             }
         }
-        else if (arg == "--codec-context-frames") {
+        else if (arg_lower == "--codec-context-frames") {
             if (i+1 < argc) {
 #ifdef WIN32
                 try { params.codec_decode_context_frames = max(0, std::stoi(argv[++i])); } catch(...) {}
@@ -210,7 +218,7 @@ int main(int argc, char** argv) {
 #endif
             }
         }
-        else if (arg == "--log-level") {
+        else if (arg_lower == "--log-level") {
             if (i+1 < argc) {
                 s2::LogLevel log_level;
                 if (parse_log_level(argv[++i], log_level)) {
@@ -220,10 +228,10 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        else if (arg == "--server")           { use_server = true; }
-        else if (arg == "-H" || arg == "--host") { if (i+1 < argc) serverParams.host = argv[++i]; }
-        else if (arg == "-P" || arg == "--port") { if (i+1 < argc) { try { serverParams.port = std::stoi(argv[++i]); } catch(...) {} } }
-        else if (arg == "-h" || arg == "--help") { print_uso(); return 0; }
+        else if (arg_lower == "--server")           { use_server = true; }
+        else if (arg_lower == "-H" || arg_lower == "--host") { if (i+1 < argc) serverParams.host = argv[++i]; }
+        else if (arg_lower == "-P" || arg_lower == "--port") { if (i+1 < argc) { try { serverParams.port = std::stoi(argv[++i]); } catch(...) {} } }
+        else if (arg_lower == "-h" || arg_lower == "--help") { print_uso(); return 0; }
     }
 
     if (list_voices) {
