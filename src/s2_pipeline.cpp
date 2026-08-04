@@ -8,6 +8,8 @@
 #include <thread>
 #include <utility>
 #include <unordered_set>
+#include <atomic>
+#include <condition_variable>
 
 #ifdef __linux__
 #include <sys/resource.h>
@@ -300,92 +302,30 @@ static void sync_tokenizer_config_from_model(Tokenizer& tokenizer, const SlowARM
     if (hp.vocab_size        > 0) tc.vocab_size        = hp.vocab_size;
 }
 
+std::string Pipeline::compute_prefill_cache_key(const PipelineParams & params,
+                                                 const int32_t * ref_codes,
+                                                 int32_t T_prompt) {
+    std::string key;
+    if (!params.voice_id.empty()) {
+        key = "voice:" + params.voice_id;
+    } else if (ref_codes && T_prompt > 0) {
+        key = "prompt:" + params.prompt_text;
+        const int32_t n = std::min(T_prompt, 16);
+        for (int32_t t = 0; t < n; ++t)
+            key += "," + std::to_string(ref_codes[t]);
+    } else {
+        key = "noprompt";
+    }
+
+    key += "|" + params.text;
+    return key;
+}
+
 Pipeline::Pipeline() {}
-Pipeline::~Pipeline() {}
-
-static bool read_all_tensor_data(
-    const std::string & gguf_path,
-    gguf_context * gguf_ctx,
-    s2::SlowARModel & model,
-    s2::AudioCodec & codec)
-{
-    const size_t data_offset = gguf_get_data_offset(gguf_ctx);
-    const int64_t n_tensors  = gguf_get_n_tensors(gguf_ctx);
-
-    std::FILE * f = std::fopen(gguf_path.c_str(), "rb");
-    if (!f) {
-        std::cerr << "[Pipeline] Cannot reopen " << gguf_path << " for data loading." << std::endl;
-        return false;
+Pipeline::~Pipeline() {
+    if (pending_offload_thread_.joinable()) {
+        pending_offload_thread_.join();
     }
-
-    const auto & model_weights = model.weight_tensor_set();
-    ggml_context * codec_ctx = codec.weights_ctx();
-    std::vector<uint8_t> tmp;
-
-    for (int64_t ti = 0; ti < n_tensors; ++ti) {
-        const char * tname = gguf_get_tensor_name(gguf_ctx, ti);
-        const size_t toff  = data_offset + gguf_get_tensor_offset(gguf_ctx, ti);
-
-        ggml_tensor * t = ggml_get_tensor(model.weights_ctx(), tname);
-        if (t && model_weights.find(t) != model_weights.end()) {
-            const size_t tsize = ggml_nbytes(t);
-            if (tmp.size() < tsize) tmp.resize(tsize);
-#ifdef _WIN32
-            _fseeki64(f, (int64_t)toff, SEEK_SET);
-#else
-            fseeko(f, (off_t)toff, SEEK_SET);
-#endif
-            if (std::fread(tmp.data(), 1, tsize, f) != tsize) {
-                std::cerr << "[Pipeline] Failed to read tensor: " << tname << std::endl;
-                std::fclose(f);
-                return false;
-            }
-            ggml_backend_tensor_set(t, tmp.data(), 0, tsize);
-            continue;
-        }
-
-        if (codec_ctx) {
-            t = ggml_get_tensor(codec_ctx, tname);
-            if (t) {
-                const size_t tsize = ggml_nbytes(t);
-                if (tmp.size() < tsize) tmp.resize(tsize);
-#ifdef _WIN32
-                _fseeki64(f, (int64_t)toff, SEEK_SET);
-#else
-                fseeko(f, (off_t)toff, SEEK_SET);
-#endif
-                if (std::fread(tmp.data(), 1, tsize, f) != tsize) {
-                    std::cerr << "[Pipeline] Failed to read tensor: " << tname << std::endl;
-                    std::fclose(f);
-                    return false;
-                }
-                ggml_backend_tensor_set(t, tmp.data(), 0, tsize);
-                continue;
-            }
-        }
-
-    }
-    tmp.clear();
-    tmp.shrink_to_fit();
-    std::fclose(f);
-
-    if (!codec.refresh_host_caches()) {
-        std::cerr << "[Pipeline] Failed to refresh codec host caches after weight load." << std::endl;
-        return false;
-    }
-
-#ifdef __linux__
-    {
-        int fd = ::open(gguf_path.c_str(), O_RDONLY);
-        if (fd >= 0) {
-            ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-            ::close(fd);
-        }
-    }
-#endif
-
-    S2_LOG_INFO_STREAM("[Model] Weights loaded. Total tensors: " << n_tensors << std::endl);
-    return true;
 }
 
 bool Pipeline::init(const PipelineParams & params) {
@@ -412,7 +352,7 @@ bool Pipeline::init(const PipelineParams & params) {
     }
 
     const auto model_t0 = std::chrono::steady_clock::now();
-    if (!model().load_shared(shared_gguf, params.model_path, params.gpu_device, params.backend_type, params.n_gpu_layers)) {
+    if (!model().load_shared(shared_gguf, params.model_path, params.gpu_device, params.backend_type, params.n_gpu_layers, params.fast_decoder_cpu, params.codebook_embeddings_cpu)) {
         safe_print_error_ln("Pipeline error: could not load model from " + params.model_path);
         gguf_free(shared_gguf);
         return false;
@@ -477,45 +417,71 @@ bool Pipeline::init(const PipelineParams & params) {
             safe_print_ln("Pipeline: loading codec on " + backend_label +
                           " device " + std::to_string(codec_gpu_device) + "...");
         }
+
         codec_loaded = codec().load_shared(&model(), shared_gguf, params.model_path, codec_gpu_device, codec_backend_type);
+
         if (!codec_loaded) {
             if (codec_backend_type == BackendType::Metal) {
-                safe_print_warn_ln(
-                    "Pipeline warning: codec " + backend_label +
-                    " load failed, falling back to CPU.");
+                safe_print_warn_ln("Pipeline warning: codec " + backend_label + " load failed, falling back to CPU.");
             } else {
-                safe_print_warn_ln(
-                    "Pipeline warning: codec " + backend_label +
-                    " load failed on device " + std::to_string(codec_gpu_device) +
-                    ", falling back to CPU.");
+                safe_print_warn_ln("Pipeline warning: codec " + backend_label + " load failed on device " +
+                                   std::to_string(codec_gpu_device) + ", falling back to CPU.");
             }
         }
     }
+
     if (!codec_loaded) {
         if (!use_gpu_codec) {
             safe_print_ln("Pipeline: loading codec on CPU.");
         }
         codec_loaded = codec().load_shared(&model(), shared_gguf, params.model_path, -1, BackendType::CPU);
     }
+
     if (!codec_loaded) {
         safe_print_error_ln("Pipeline error: could not load codec from " + params.model_path);
         gguf_free(shared_gguf);
         return false;
     }
 
-    if (!read_all_tensor_data(params.model_path, shared_gguf, model(), codec())) {
-        safe_print_error_ln("Pipeline error: failed to read tensor data from " + params.model_path);
-        gguf_free(shared_gguf);
-        return false;
-    }
-
     gguf_free(shared_gguf);
 
+    if (!codec().refresh_host_caches_from_mmap()) {
+        safe_print_error_ln("Pipeline error: failed to refresh VQ caches from mmap");
+        return false;
+    }
     const auto codec_t1 = std::chrono::steady_clock::now();
+
+    const auto model_weights_t0 = std::chrono::steady_clock::now();
+    const bool defer_weight_loading = params.enable_vram_swap && model().prefers_gpu();
+
+    if (!defer_weight_loading) {
+        if (!model().allocate_and_load_weights()) {
+            safe_print_error_ln("Pipeline error: failed to allocate and load Slow-AR weights");
+            return false;
+        }
+    } else {
+        safe_print_ln("[Pipeline] Deferring Slow-AR weight loading to first request (VRAM swap active).");
+        model().mapped_file().warm_page_cache();
+    }
+    const auto model_weights_t1 = std::chrono::steady_clock::now();
 
     sync_tokenizer_config_from_model(tokenizer(), model());
 
     initialized_ = true;
+    
+    model_prefers_gpu_ = model().prefers_gpu();
+    codec_prefers_gpu_ = use_gpu_codec;
+
+    if (model_prefers_gpu_ && codec_prefers_gpu_) {
+        safe_print_ln("[Pipeline] VRAM State Machine: Case 1 (Both prefer GPU) - Codec is lazily allocated on demand.");
+    } else if (model_prefers_gpu_ && !codec_prefers_gpu_) {
+        safe_print_ln("[Pipeline] VRAM State Machine: Case 2 (Slow-AR GPU, Codec CPU) - Ready.");
+    } else if (!model_prefers_gpu_ && codec_prefers_gpu_) {
+        safe_print_ln("[Pipeline] VRAM State Machine: Case 3 (Slow-AR CPU, Codec GPU) - Codec is lazily allocated on demand.");
+    } else {
+        safe_print_ln("[Pipeline] VRAM State Machine: Case 4 (All CPU) - Ready.");
+    }
+
     const auto init_t1 = std::chrono::steady_clock::now();
     safe_print_ln(
         "[Metrics] Init: tokenizer=" +
@@ -524,7 +490,10 @@ bool Pipeline::init(const PipelineParams & params) {
         std::to_string(std::chrono::duration<double, std::milli>(model_t1 - model_t0).count()) +
         " ms, codec=" +
         std::to_string(std::chrono::duration<double, std::milli>(codec_t1 - codec_t0).count()) +
-        " ms (" + codec().backend_name() + "), total=" +
+        " ms (" + codec().backend_name() + "), model_weights=" +
+        std::to_string(std::chrono::duration<double, std::milli>(model_weights_t1 - model_weights_t0).count()) +
+        (defer_weight_loading ? " ms (deferred)" : " ms") +
+        ", total=" +
         std::to_string(std::chrono::duration<double, std::milli>(init_t1 - init_t0).count()) +
         " ms, max_rss=" +
         std::to_string(get_max_rss_mb()) + " MB");
@@ -593,6 +562,14 @@ bool Pipeline::resolve_reference_prompt_locked(const PipelineParams & params, Au
     voice_mgr_.set_storage_dir(params.voice_storage_dir);
 
     if (!ref_audio.samples.empty()) {
+        const bool need_encoder_vram = params.enable_vram_swap && codec_prefers_gpu_;
+        if (need_encoder_vram) {
+            if (codec().is_decoder_on_gpu()) {
+                codec().free_decoder_weights();
+            }
+            codec().restore_encoder_weights();
+        }
+
         const auto ref_t0 = std::chrono::steady_clock::now();
         if (!codec().encode(ref_audio.samples.data(), static_cast<int32_t>(ref_audio.samples.size()),
                             params.gen.n_threads, ref_codes, T_prompt)) {
@@ -602,6 +579,10 @@ bool Pipeline::resolve_reference_prompt_locked(const PipelineParams & params, Au
         }
         const auto ref_t1 = std::chrono::steady_clock::now();
         ref_encode_ms = std::chrono::duration<double, std::milli>(ref_t1 - ref_t0).count();
+
+        if (need_encoder_vram) {
+            codec().free_encoder_weights();
+        }
 
         if (!ref_codes.empty() && params.save_voice && !params.voice_id.empty()) {
             save_voice_profile_locked(params.voice_id, ref_codes, T_prompt,
@@ -779,6 +760,7 @@ bool Pipeline::encode_prompt_audio_data(const AudioData & ref_audio, int32_t n_t
 
 bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_audio, std::vector<float>& audio_out) {
     std::lock_guard<std::mutex> lock(synthesize_mutex_);
+
     std::vector<int32_t> ref_codes;
     int32_t T_prompt = 0;
     double ref_encode_ms = 0.0;
@@ -787,6 +769,12 @@ bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_aud
     if (!initialized_) {
         safe_print_error_ln("Pipeline not initialized.");
         return false;
+    }
+
+    if (params.enable_vram_swap) {
+        if (pending_offload_thread_.joinable()) {
+            pending_offload_thread_.join();
+        }
     }
 
     if (!resolve_reference_prompt_locked(params, ref_audio, ref_codes, T_prompt,
@@ -833,56 +821,444 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         return false;
     }
 
+    if (params.enable_vram_swap) {
+        if (pending_offload_thread_.joinable()) {
+            pending_offload_thread_.join();
+        }
+    }
+
     CodecDecodeCacheScope codec_decode_cache_scope(codec());
-    model().clear_kv_cache();
 
     safe_print_ln("--- Pipeline Synthesize ---");
     safe_print_ln("Text: " + params.text);
 
-    const int32_t num_codebooks = model().hparams().num_codebooks;
+    std::thread vram_phase1_thread;
+    bool vram_phase1_ok = true;
 
+    if (params.enable_vram_swap) {
+        vram_phase1_thread = std::thread([this, &params, &vram_phase1_ok]() {
+            if (model_prefers_gpu_ && !model().is_weights_on_gpu()) {
+                safe_print_ln("[Pipeline] Restoring Slow-AR to VRAM for generation...");
+                model().acquire_compute_resources();
+                if (!model().restore_weights_to_gpu()) {
+                    safe_print_error_ln("Pipeline error: Slow-AR weight restore failed.");
+                    vram_phase1_ok = false;
+                    return;
+                }
+                safe_print_ln("[VRAM Diag] Post-SlowAR restore: Slow-AR=" + std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" + std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
+            }
+
+            if (!model_prefers_gpu_ && codec_prefers_gpu_ && !codec().is_decoder_on_gpu()) {
+                safe_print_ln("[Pipeline] Pre-loading Audio Codec decoder to VRAM (hiding behind CPU gen)...");
+                codec().restore_decoder_weights();
+                safe_print_ln("[VRAM Diag] Post-Decoder restore: Slow-AR=" + std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" + std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
+            }
+
+            if (model_prefers_gpu_ && codec_prefers_gpu_) {
+                if (codec().is_encoder_on_gpu()) {
+                    safe_print_ln("[Pipeline] Freeing codec encoder from VRAM (not needed during generation)...");
+                    codec().free_encoder_weights();
+                }
+                if (codec().is_decoder_on_gpu()) {
+                    safe_print_ln("[Pipeline] Freeing codec decoder from VRAM (not needed during generation)...");
+                    codec().free_decoder_weights();
+                }
+                if (codec().is_weights_on_gpu()) {
+                    safe_print_ln("[Pipeline] Freeing Audio Codec from VRAM for Slow-AR generation...");
+                    codec().free_gpu_weights();
+                }
+                safe_print_ln("[VRAM Diag] Post-Codec free: Slow-AR=" + std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" + std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
+            }
+
+            safe_print_ln("[VRAM Diag] End-Phase1: Slow-AR=" +
+                std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" +
+                std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
+        });
+    }
+
+    const int32_t num_codebooks = model().hparams().num_codebooks;
     PromptTensor prompt = build_prompt(
         tokenizer(), params.text, params.prompt_text,
-        ref_codes,
-        num_codebooks, T_prompt);
-
+        ref_codes, num_codebooks, T_prompt);
     int32_t max_seq_len = prompt.cols + params.gen.max_new_tokens;
+
+    const bool kv_reuse = params.enable_kv_reuse && params.is_persistent;
+    const bool keep_kv_on_gpu = kv_reuse && params.kv_cache_vram;
+
+    const bool need_fresh_kv = !kv_reuse ||
+        model().kv_max_seq_len() < max_seq_len ||
+        model().kv_max_seq_len() == 0;
+
+    if (need_fresh_kv) {
+        model().clear_kv_cache();
+    }
+
     const auto kv_t0 = std::chrono::steady_clock::now();
-    if (!model().init_kv_cache(max_seq_len)) {
+    std::thread kv_init_thread;
+    bool kv_init_ok = true;
+
+    if (need_fresh_kv) {
+        kv_init_thread = std::thread([&]() {
+            kv_init_ok = model().init_kv_cache(max_seq_len);
+        });
+    } else {
+        kv_init_thread = std::thread([&]() {
+            model().reset_kv_cache();
+        });
+    }
+
+    if (vram_phase1_thread.joinable()) {
+        vram_phase1_thread.join();
+    }
+    if (!vram_phase1_ok) {
+        kv_init_thread.join();
+        return false;
+    }
+
+    kv_init_thread.join();
+    if (!kv_init_ok) {
         safe_print_error_ln("Pipeline error: init_kv_cache failed.");
         return false;
     }
+
     const auto kv_t1 = std::chrono::steady_clock::now();
 
-    const auto gen_t0 = std::chrono::steady_clock::now();
-    GenerateResult res = generate(model(), tokenizer().config(), prompt, params.gen);
-    const auto gen_t1 = std::chrono::steady_clock::now();
+    const std::string cache_key = compute_prefill_cache_key(params, ref_codes, T_prompt);
+    bool prefill_hit = false;
+    StepResult cached_state;
 
-    if (res.n_frames == 0) {
-        safe_print_error_ln("Pipeline error: generation produced no frames.");
-        return false;
+    if (kv_reuse && prefill_cache_.valid &&
+        prefill_cache_.cache_key == cache_key &&
+        prefill_cache_.max_seq_len >= max_seq_len)
+    {
+        if (keep_kv_on_gpu && prefill_cache_.vram_resident) {
+            model().set_n_past(prefill_cache_.n_past);
+            cached_state = prefill_cache_.state;
+            prefill_hit = true;
+            safe_print_ln("[Pipeline] Prefill cache HIT (VRAM-pinned, key=" + cache_key + ")");
+        } else if (!keep_kv_on_gpu && !prefill_cache_.k_data.empty()) {
+            if (model().restore_kv_state(prefill_cache_.k_data, prefill_cache_.v_data,
+                                         prefill_cache_.n_past)) {
+                cached_state = prefill_cache_.state;
+                prefill_hit = true;
+                safe_print_ln("[Pipeline] Prefill cache HIT (system RAM, key=" + cache_key + ")");
+            }
+        }
     }
+
+    StepResult prefill_state;
+    double prefill_ms = 0.0;
+    std::thread kv_save_thread;
+
+    if (!prefill_hit) {
+        const int32_t rows = prompt.rows;
+        const int32_t cols = prompt.cols;
+        std::vector<int32_t> prompt_tm(static_cast<size_t>(rows) * cols);
+        for (int32_t r = 0; r < rows; ++r)
+            for (int32_t c = 0; c < cols; ++c)
+                prompt_tm[static_cast<size_t>(c) * rows + r] =
+                    prompt.data[static_cast<size_t>(r) * cols + c];
+
+        safe_print_ln("[Generate] Prefilling " + std::to_string(prompt.cols) + " tokens...");
+        const auto pf_t0 = std::chrono::steady_clock::now();
+        if (!model().prefill_fast(prompt_tm, prompt.cols, params.gen.n_threads, prefill_state)) {
+            safe_print_error_ln("Pipeline error: prefill failed.");
+            return false;
+        }
+        const auto pf_t1 = std::chrono::steady_clock::now();
+        prefill_ms = std::chrono::duration<double, std::milli>(pf_t1 - pf_t0).count();
+
+        if (kv_reuse) {
+            prefill_cache_.cache_key   = cache_key;
+            prefill_cache_.n_past      = model().n_past();
+            prefill_cache_.max_seq_len = model().kv_max_seq_len();
+            prefill_cache_.state       = prefill_state;
+            prefill_cache_.vram_resident = false;
+            prefill_cache_.k_data.clear();
+            prefill_cache_.v_data.clear();
+
+            if (keep_kv_on_gpu) {
+                prefill_cache_.vram_resident = true;
+            } else {
+                const int32_t save_n_past = prefill_cache_.n_past;
+                kv_save_thread = std::thread([this, save_n_past]() {
+                    model().save_kv_state(prefill_cache_.k_data,
+                                          prefill_cache_.v_data,
+                                          save_n_past);
+                });
+            }
+            prefill_cache_.valid = true;
+            safe_print_ln("[Pipeline] Prefill cache SAVED (key=" + cache_key +
+                          ", n_past=" + std::to_string(prefill_cache_.n_past) +
+                          (keep_kv_on_gpu ? ", VRAM)" : ", RAM, async)"));
+        }
+    }
+
+    const bool can_overlap_decode =
+        model_prefers_gpu_ && !codec_prefers_gpu_;
 
     const int32_t offline_decode_stride_frames =
         params.stream_decode_stride_frames > 0 ? params.stream_decode_stride_frames : 16;
-    double decode_ms = 0.0;
-    int32_t decode_batches = 0;
-    const auto decode_t0 = std::chrono::steady_clock::now();
-    if (!decode_codes_windowed(codec(), res.codes.data(), res.n_frames, num_codebooks,
-                               params.gen.n_threads, offline_decode_stride_frames,
-                               params.codec_decode_context_frames,
-                               audio_out, &decode_ms, &decode_batches)) {
-        safe_print_error_ln("Pipeline error: decode failed.");
-        return false;
-    }
-    const auto decode_t1 = std::chrono::steady_clock::now();
 
-    model().clear_kv_cache();
+    GenerateResult res;
+    double   gen_ms         = 0.0;
+    double   decode_ms      = 0.0;
+    int32_t  decode_batches = 0;
+    double   decode_wall_ms = 0.0;
+
+    GenerateParams gen_params = params.gen;
+
+    if (can_overlap_decode) {
+        const int32_t codec_context_frames =
+            params.codec_decode_context_frames >= 0
+                ? params.codec_decode_context_frames
+                : offline_decode_stride_frames;
+        const size_t samples_per_frame =
+            static_cast<size_t>(std::max(1, codec().samples_per_code_frame()));
+
+        std::vector<std::vector<int32_t>> accum(num_codebooks);
+        for (auto & row : accum)
+            row.reserve(static_cast<size_t>(params.gen.max_new_tokens));
+
+        std::mutex              decode_mtx;
+        std::condition_variable decode_cv;
+        std::atomic<int32_t>    frames_available{0};
+        std::atomic<bool>       gen_done{false};
+        bool                    decode_failed = false;
+
+        std::vector<float> audio_accum;
+        audio_accum.reserve(
+            static_cast<size_t>(params.gen.max_new_tokens) * samples_per_frame);
+        int32_t committed_frames = 0;
+
+        auto decode_window = [&](int32_t total_frames, bool finalize) -> bool {
+            if (total_frames <= 0 || total_frames <= committed_frames)
+                return true;
+            const int32_t stable_frames = total_frames;
+            if (stable_frames <= committed_frames && !finalize)
+                return true;
+            const int32_t window_start =
+                std::max(0, committed_frames - codec_context_frames);
+            const int32_t window_frames = total_frames - window_start;
+            if (window_frames <= 0)
+                return true;
+            std::vector<int32_t> codes(
+                static_cast<size_t>(num_codebooks) * window_frames);
+            {
+                std::lock_guard<std::mutex> lock(decode_mtx);
+                for (int32_t cb = 0; cb < num_codebooks; ++cb) {
+                    std::copy(
+                        accum[cb].begin() + window_start,
+                        accum[cb].begin() + total_frames,
+                        codes.begin() + static_cast<size_t>(cb) * window_frames);
+                }
+            }
+            std::vector<float> pcm;
+            const auto t0 = std::chrono::steady_clock::now();
+            if (!codec().decode(codes.data(), window_frames,
+                                params.gen.n_threads, pcm)) {
+                return false;
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            decode_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            decode_batches++;
+            const size_t emit_begin =
+                static_cast<size_t>(std::max(0, committed_frames - window_start))
+                * samples_per_frame;
+            const size_t emit_end = finalize
+                ? pcm.size()
+                : std::min(pcm.size(),
+                           static_cast<size_t>(
+                               std::max(0, stable_frames - window_start))
+                           * samples_per_frame);
+            if (emit_end > emit_begin) {
+                audio_accum.insert(audio_accum.end(),
+                                   pcm.begin() + emit_begin,
+                                   pcm.begin() + emit_end);
+            }
+            committed_frames = finalize ? total_frames : stable_frames;
+            return true;
+        };
+
+        const auto decode_thread_t0 = std::chrono::steady_clock::now();
+        std::thread decode_thread([&]() {
+            int32_t last_committed = 0;
+            while (true) {
+                std::unique_lock<std::mutex> lock(decode_mtx);
+                decode_cv.wait(lock, [&]() {
+                    return frames_available.load() > last_committed
+                        || gen_done.load();
+                });
+                const int32_t avail = frames_available.load();
+                const bool   done   = gen_done.load();
+                lock.unlock();
+                if (avail <= last_committed && done)
+                    break;
+                if (!decode_window(avail, done)) {
+                    decode_failed = true;
+                    break;
+                }
+                last_committed = committed_frames;
+            }
+        });
+
+        gen_params.on_frame = [&](const FrameCallbackData & fcd) -> bool {
+            {
+                std::lock_guard<std::mutex> lock(decode_mtx);
+                for (int32_t cb = 0; cb < fcd.num_codebooks; ++cb)
+                    accum[cb].push_back(fcd.codes[cb]);
+            }
+            frames_available.store(fcd.total_frames);
+            decode_cv.notify_one();
+            return true;
+        };
+
+        const auto gen_t0 = std::chrono::steady_clock::now();
+        res = generate(model(), tokenizer().config(), prompt, gen_params,
+                       prefill_hit ? &cached_state : &prefill_state);
+        const auto gen_t1 = std::chrono::steady_clock::now();
+        gen_ms = std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count();
+
+        if (kv_save_thread.joinable()) {
+            kv_save_thread.join();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(decode_mtx);
+            gen_done.store(true);
+        }
+        decode_cv.notify_one();
+        decode_thread.join();
+        const auto decode_thread_t1 = std::chrono::steady_clock::now();
+        decode_wall_ms = std::chrono::duration<double, std::milli>(
+            decode_thread_t1 - decode_thread_t0).count();
+
+        if (res.n_frames == 0) {
+            safe_print_error_ln("Pipeline error: generation produced no frames.");
+            return false;
+        }
+        if (decode_failed) {
+            safe_print_error_ln("Pipeline error: overlapped decode failed.");
+            return false;
+        }
+
+        if (params.enable_vram_swap) {
+            if (model_prefers_gpu_ && model().is_weights_on_gpu()) {
+                if (params.is_persistent) {
+                    if (!params.more_segments_pending) {
+                        safe_print_ln("[Pipeline] Freeing Slow-AR from VRAM (request complete)...");
+                        model().free_gpu_weights();
+                        if (!keep_kv_on_gpu) model().free_compute_buffers();
+                        safe_print_ln("[VRAM Diag] Post-SlowAR free: Slow-AR=" + std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" + std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
+                    }
+                } else {
+                    safe_print_ln("[Pipeline] Single-shot: Freeing Slow-AR from VRAM...");
+                    model().free_gpu_weights();
+                    model().free_compute_buffers();
+                    safe_print_ln("[VRAM Diag] Post-SlowAR free: Slow-AR=" + std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" + std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
+                }
+            }
+        }
+
+        if (params.enable_vram_swap && params.is_persistent &&
+            params.enable_hot_swap && !params.more_segments_pending) {
+            safe_print_ln("[Pipeline] Hot-Swap: Releasing compute resources...");
+            model().free_compute_buffers();
+            safe_print_ln("[Pipeline] Hot-Swap: Spawning background thread to free VRAM & RAM...");
+            std::thread offload_thread([this]() {
+                if (model().is_weights_on_gpu()) model().free_gpu_weights();
+                if (codec().is_decoder_on_gpu()) codec().free_decoder_weights();
+                if (codec().is_encoder_on_gpu()) codec().free_encoder_weights();
+                if (codec().is_weights_on_gpu()) codec().free_gpu_weights();
+                model().mapped_file().drop_page_cache();
+                codec().mapped_file().drop_page_cache();
+                safe_print_ln("[Pipeline] Hot-Swap: Background VRAM & RAM free complete.");
+            });
+            pending_offload_thread_ = std::move(offload_thread);
+        }
+
+        audio_out = std::move(audio_accum);
+
+    } else {
+        const auto gen_t0 = std::chrono::steady_clock::now();
+        res = generate(model(), tokenizer().config(), prompt, gen_params,
+                       prefill_hit ? &cached_state : &prefill_state);
+        const auto gen_t1 = std::chrono::steady_clock::now();
+        gen_ms = std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count();
+
+        if (kv_save_thread.joinable()) {
+            kv_save_thread.join();
+        }
+
+        if (res.n_frames == 0) {
+            safe_print_error_ln("Pipeline error: generation produced no frames.");
+            return false;
+        }
+
+        if (params.enable_vram_swap) {
+            if (codec_prefers_gpu_ && !codec().is_decoder_on_gpu()) {
+                safe_print_ln("[Pipeline] Restoring Audio Codec DECODER to VRAM (alongside Slow-AR)...");
+                codec().restore_decoder_weights();
+                safe_print_ln("[VRAM Diag] Post-Decoder restore: Slow-AR=" + std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" + std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
+            }
+        }
+
+        const auto decode_t0 = std::chrono::steady_clock::now();
+        bool decode_ok = decode_codes_windowed(codec(), res.codes.data(), res.n_frames, num_codebooks,
+                                   params.gen.n_threads, offline_decode_stride_frames,
+                                   params.codec_decode_context_frames,
+                                   audio_out, &decode_ms, &decode_batches);
+        const auto decode_t1 = std::chrono::steady_clock::now();
+        decode_wall_ms = std::chrono::duration<double, std::milli>(decode_t1 - decode_t0).count();
+
+        if (params.enable_vram_swap) {
+            if (params.is_persistent) {
+                if (params.enable_hot_swap && !params.more_segments_pending) {
+                    safe_print_ln("[Pipeline] Hot-Swap: Releasing compute resources...");
+                    model().free_compute_buffers();
+                    safe_print_ln("[Pipeline] Hot-Swap: Spawning background thread to free VRAM & RAM...");
+                    std::thread offload_thread([this]() {
+                        if (model().is_weights_on_gpu()) model().free_gpu_weights();
+                        if (codec().is_decoder_on_gpu()) codec().free_decoder_weights();
+                        if (codec().is_encoder_on_gpu()) codec().free_encoder_weights();
+                        if (codec().is_weights_on_gpu()) codec().free_gpu_weights();
+                        model().mapped_file().drop_page_cache();
+                        codec().mapped_file().drop_page_cache();
+                        safe_print_ln("[Pipeline] Hot-Swap: Background VRAM & RAM free complete.");
+                    });
+                    pending_offload_thread_ = std::move(offload_thread);
+                } else {
+                    if (codec().is_decoder_on_gpu()) codec().free_decoder_weights();
+
+                    if (!params.more_segments_pending) {
+                        model().free_gpu_weights();
+                        if (!keep_kv_on_gpu) model().free_compute_buffers();
+                    }
+                }
+            } else {
+                if (codec().is_decoder_on_gpu()) codec().free_decoder_weights();
+                model().free_gpu_weights();
+                model().free_compute_buffers();
+            }
+        }
+
+        if (!decode_ok) {
+            safe_print_error_ln("Pipeline error: decode failed.");
+            return false;
+        }
+    }
+
+    if (!params.more_segments_pending) {
+        if (!kv_reuse) {
+            model().clear_kv_cache();
+        } else if (!keep_kv_on_gpu) {
+            model().set_n_past(0);
+        }
+    }
+
     const auto synth_t1 = std::chrono::steady_clock::now();
 
     const double kv_ms = std::chrono::duration<double, std::milli>(kv_t1 - kv_t0).count();
-    const double gen_ms = std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count();
-    const double decode_wall_ms = std::chrono::duration<double, std::milli>(decode_t1 - decode_t0).count();
     const double total_ms = std::chrono::duration<double, std::milli>(synth_t1 - synth_t0).count();
     const double audio_seconds = codec().sample_rate() > 0
         ? (static_cast<double>(audio_out.size()) / codec().sample_rate())
@@ -897,23 +1273,36 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         ", audio_s=" + std::to_string(audio_seconds) +
         ", ref_encode=" + std::to_string(ref_encode_ms) +
         " ms, kv_init=" + std::to_string(kv_ms) +
+        " ms, prefill=" + std::to_string(prefill_ms) +
         " ms, generate=" + std::to_string(gen_ms) +
         " ms, decode=" + std::to_string(decode_ms) +
         " ms, decode_wall=" + std::to_string(decode_wall_ms) +
         " ms, decode_batches=" + std::to_string(decode_batches) +
         ", decode_stride=" + std::to_string(offline_decode_stride_frames) +
-        " frames, total=" + std::to_string(total_ms) +
+        " frames" +
+        (can_overlap_decode ? ", decode_mode=overlapped" : ", decode_mode=sequential") +
+        (prefill_hit ? ", prefill=cached" : ", prefill=computed") +
+        (params.more_segments_pending ? ", vram=held" : "") +
+        ", total=" + std::to_string(total_ms) +
         " ms, gen_avg=" + std::to_string(gen_ms_per_frame) +
         " ms/frame, total_avg=" + std::to_string(total_ms_per_frame) +
         " ms/frame, gen_rtf=" + std::to_string(gen_rtf) +
         ", total_rtf=" + std::to_string(total_rtf) +
         ", max_rss=" + std::to_string(get_max_rss_mb()) + " MB");
+
+    if (params.enable_vram_swap) {
+        safe_print_ln("[VRAM Diag] Post-Phase3: Slow-AR=" +
+            std::to_string(model().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB, Codec=" +
+            std::to_string(codec().get_gpu_memory_usage_bytes() / 1024 / 1024) + " MB");
+    }
+
     return true;
 }
 
 bool Pipeline::synthesize_streaming_raw(const PipelineParams & params, AudioData & ref_audio,
                                         StreamingSink & sink) {
     std::lock_guard<std::mutex> lock(synthesize_mutex_);
+
     std::vector<int32_t> ref_codes;
     int32_t T_prompt = 0;
     double ref_encode_ms = 0.0;
@@ -923,6 +1312,12 @@ bool Pipeline::synthesize_streaming_raw(const PipelineParams & params, AudioData
         safe_print_error_ln("Pipeline not initialized.");
         sink.on_error("Pipeline not initialized");
         return false;
+    }
+
+    if (params.enable_vram_swap) {
+        if (pending_offload_thread_.joinable()) {
+            pending_offload_thread_.join();
+        }
     }
 
     if (!resolve_reference_prompt_locked(params, ref_audio, ref_codes, T_prompt,
@@ -961,6 +1356,28 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
         safe_print_error_ln("Pipeline not initialized.");
         sink.on_error("Pipeline not initialized");
         return false;
+    }
+
+    if (params.enable_vram_swap) {
+        if (pending_offload_thread_.joinable()) {
+            pending_offload_thread_.join();
+        }
+        
+        if (model_prefers_gpu_ && !model().is_weights_on_gpu()) {
+            safe_print_ln("[Pipeline] Streaming: Restoring Slow-AR to VRAM...");
+            model().acquire_compute_resources();
+            model().restore_weights_to_gpu();
+        }
+
+        if (codec_prefers_gpu_) {
+            if (codec().is_encoder_on_gpu()) {
+                codec().free_encoder_weights();
+            }
+            if (!codec().is_decoder_on_gpu() && !codec().is_weights_on_gpu()) {
+                safe_print_ln("[Pipeline] Streaming: Restoring Audio Codec DECODER to VRAM...");
+                codec().restore_decoder_weights();
+            }
+        }
     }
 
     CodecDecodeCacheScope codec_decode_cache_scope(codec());
@@ -1176,6 +1593,33 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
         " ms/frame, ar_avg=" + std::to_string(ar_ms_per_frame) +
         " ms/frame, total_rtf=" + std::to_string(total_rtf) +
         ", max_rss=" + std::to_string(get_max_rss_mb()) + " MB");
+
+    if (params.enable_vram_swap) {
+        if (params.is_persistent) {
+            if (params.enable_hot_swap) {
+                safe_print_ln("[Pipeline] Hot-Swap: Releasing compute resources...");
+                model().free_compute_buffers();
+                
+                safe_print_ln("[Pipeline] Hot-Swap: Spawning background thread to free VRAM & RAM...");
+                std::thread offload_thread([this]() {
+                    if (model().is_weights_on_gpu()) model().free_gpu_weights();
+                    if (codec().is_decoder_on_gpu()) codec().free_decoder_weights();
+                    if (codec().is_encoder_on_gpu()) codec().free_encoder_weights();
+                    if (codec().is_weights_on_gpu()) codec().free_gpu_weights();
+                    model().mapped_file().drop_page_cache();
+                    codec().mapped_file().drop_page_cache();
+                    safe_print_ln("[Pipeline] Hot-Swap: Background VRAM & RAM free complete.");
+                });
+                pending_offload_thread_ = std::move(offload_thread);
+            } else {
+                if (codec().is_decoder_on_gpu()) codec().free_decoder_weights();
+                model().free_gpu_weights();
+                model().free_compute_buffers();
+            }
+        } else {
+            safe_print_ln("[Pipeline] Single-shot mode: Skipping post-stream VRAM restore.");
+        }
+    }
     return true;
 }
 

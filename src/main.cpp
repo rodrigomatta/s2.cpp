@@ -90,6 +90,12 @@ void print_uso() {
     safe_print("  --codec-auto                Benchmark codec backends and keep the fastest (default)\n");
     safe_print("  --codec-follow-backend      Force codec to follow the selected GPU backend\n");
     safe_print("  --codec-cpu                 Force codec on CPU even when model uses GPU\n");
+    safe_print("  --fast-decoder-cpu          Force the 4-layer fast decoder on CPU (enables cached graph batching, saves ~200-400 MB VRAM at Q4)\n");
+    safe_print("  --codebook-cpu              Force codebook_embeddings on CPU even at full GPU offload (saves ~56 MB VRAM at Q4, costs ~4-5 ms/frame)\n");
+    safe_print("  --no-vram-swap              Disable phase-gated VRAM swapping between Slow-AR and Codec (keeps both in VRAM simultaneously instead)\n");
+    safe_print("  --hot-swap                  Aggressively evict weights and OS page cache after each server request (~100 MB RAM, ~25 MB VRAM idle)\n");
+    safe_print("  --no-kv-reuse               Disable KV cache reuse and prompt prefill caching (old per-request free/realloc behavior)\n");
+    safe_print("  --kv-cache-vram             Pin prefill cache in VRAM between requests (default: system RAM, lower VRAM usage)\n");
     safe_print("  --stream-file               Write output WAV through the streaming path\n");
     safe_print("  --stream-decode-stride <n>  Decode cadence in frames (0 = auto: server 4, file/offline 16)\n");
     safe_print("  --codec-context-frames <n>  Override codec decode history (lower uses less VRAM, default: auto)\n");
@@ -186,16 +192,22 @@ int main(int argc, char** argv) {
         else if (arg == "-temp" || arg == "--temp" || arg == "--temperature") { if (i+1 < argc) { try { params.gen.temperature = std::stof(argv[++i]); } catch(...) {} } }
         else if (arg == "-top-p" || arg == "--top-p")      { if (i+1 < argc) { try { params.gen.top_p       = std::stof(argv[++i]); } catch(...) {} } }
         else if (arg == "-top-k" || arg == "--top-k")      { if (i+1 < argc) { try { params.gen.top_k       = std::stoi(argv[++i]); } catch(...) {} } }
-        else if (arg == "--dynamic-normalize")     { params.normalize_dynamic = true;  }
-        else if (arg == "--no-dynamic-normalize")  { params.normalize_dynamic = false; }
-        else if (arg == "--no-trim-silence")  { params.trim_silence     = false; }
-        else if (arg == "--trim-silence")     { params.trim_silence     = true;  }
-        else if (arg == "--no-normalize")     { params.normalize_output = false; }
-        else if (arg == "--normalize")        { params.normalize_output = true;  }
-        else if (arg == "--codec-auto")       { params.codec_auto_backend = true;  params.codec_follow_backend = true;  }
-        else if (arg == "--codec-follow-backend") { params.codec_auto_backend = false; params.codec_follow_backend = true; }
-        else if (arg == "--codec-cpu")        { params.codec_auto_backend = false; params.codec_follow_backend = false; }
-        else if (arg == "--stream-file")      { use_stream_file = true; }
+        else if (arg == "--dynamic-normalize")     { params.normalize_dynamic  = true;  }
+        else if (arg == "--no-dynamic-normalize")  { params.normalize_dynamic  = false; }
+        else if (arg == "--no-trim-silence")       { params.trim_silence       = false; }
+        else if (arg == "--trim-silence")          { params.trim_silence       = true;  }
+        else if (arg == "--no-normalize")          { params.normalize_output   = false; }
+        else if (arg == "--normalize")             { params.normalize_output   = true;  }
+        else if (arg == "--codec-auto")            { params.codec_auto_backend = true;  params.codec_follow_backend = true; }
+        else if (arg == "--codec-follow-backend")  { params.codec_auto_backend = false; params.codec_follow_backend = true; }
+        else if (arg == "--codec-cpu")             { params.codec_auto_backend = false; params.codec_follow_backend = false; }
+        else if (arg == "--fast-decoder-cpu")      { params.fast_decoder_cpu = true; }
+        else if (arg == "--codebook-cpu")          { params.codebook_embeddings_cpu = true; }
+        else if (arg == "--no-vram-swap")          { params.enable_vram_swap   = false; }
+        else if (arg == "--hot-swap")              { params.enable_hot_swap    = true; }
+        else if (arg == "--no-kv-reuse")           { params.enable_kv_reuse    = false; }
+        else if (arg == "--kv-cache-vram")         { params.kv_cache_vram      = true; }
+        else if (arg == "--stream-file")           { use_stream_file = true; }
         else if (arg == "--stream-decode-stride") {
             if (i+1 < argc) {
                 try { params.stream_decode_stride_frames = std::stoi(argv[++i]); } catch(...) {}
@@ -309,6 +321,7 @@ int main(int argc, char** argv) {
 
     if (use_server) {
         serverParams.pipeline = params;
+        serverParams.pipeline.is_persistent = true;
         s2::Server server;
         if (!server.serve(serverParams)) {
             safe_print_error("Server initialization failed.\n");

@@ -89,6 +89,7 @@ set(S2_CORE_SOURCES
     src/s2_pipeline.cpp
     src/s2_server.cpp
     src/s2_voice.cpp
+    src/s2_mapped_file.cpp
 )
 
 function(s2_configure_target target_name)

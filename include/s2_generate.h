@@ -41,7 +41,8 @@ GenerateResult generate(
     SlowARModel & model,
     const TokenizerConfig & config,
     const PromptTensor & prompt,
-    const GenerateParams & params
+    const GenerateParams & params,
+    const StepResult * initial_state = nullptr
 );
 
 }
