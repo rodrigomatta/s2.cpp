@@ -13,7 +13,7 @@ option(S2_VULKAN  "Build with Vulkan backend"  OFF)
 option(S2_CUDA    "Build with CUDA backend"    OFF)
 option(S2_METAL   "Build with Metal backend"   OFF)
 option(S2_BUILD_SHARED_LIBRARIES "Build S2 shared and static library targets" OFF)
-option(S2_AUTO_APPLY_LOCAL_PATCHES "Automatically apply local patches from patches/*.patch during build" ON)
+option(S2_AUTO_APPLY_LOCAL_PATCHES "Automatically apply local patches from patches/*.patch during build" OFF)
 
 if(S2_METAL AND NOT APPLE)
     message(FATAL_ERROR "S2_METAL is only supported on Apple platforms.")
