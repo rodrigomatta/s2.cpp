@@ -183,21 +183,31 @@ static bool allocate_weight_buffers(ggml_backend_t backend,
     return true;
 }
 
-SlowARModel::SlowARModel() {}
+SlowARModel::SlowARModel()
+    : fast_gallocr_(nullptr)
+{}
 
 SlowARModel::~SlowARModel() {
+    for (auto & slot : fast_slots_) {
+        if (slot.allocr) { ggml_gallocr_free(slot.allocr); slot.allocr = nullptr; }
+        if (slot.ctx)    { ggml_free(slot.ctx);             slot.ctx    = nullptr; }
+    }
+    fast_slots_.clear();
+
+    if (fast_slot_.allocr) { ggml_gallocr_free(fast_slot_.allocr); fast_slot_.allocr = nullptr; }
+    if (fast_slot_.ctx)    { ggml_free(fast_slot_.ctx);             fast_slot_.ctx    = nullptr; }
+    fast_slot_.valid = false;
+
+    if (fast_gallocr_) { ggml_gallocr_free(fast_gallocr_); fast_gallocr_ = nullptr; }
+
     if (fast_sched_)     ggml_backend_sched_free(fast_sched_);
     if (sched_)          ggml_backend_sched_free(sched_);
-
-    if (kv_buf_) ggml_backend_buffer_free(kv_buf_);
+    if (kv_buf_)         ggml_backend_buffer_free(kv_buf_);
     free_backend_buffers(weights_.model_bufs_gpu);
     free_backend_buffers(weights_.model_bufs_cpu);
-
     if (backend_gpu_)    ggml_backend_free(backend_gpu_);
     if (backend_cpu_)    ggml_backend_free(backend_cpu_);
-
     if (ctx_kv_)         ggml_free(ctx_kv_);
-
     weights_.ctx_w = nullptr;
 }
 
@@ -1223,34 +1233,361 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
     ggml_build_forward_expand(gf, logits);
 
     ggml_backend_cpu_set_n_threads(backend_cpu_, resolve_n_threads(n_threads));
-    ggml_backend_sched_reset(fast_sched_);
 
-    if (!ggml_backend_sched_alloc_graph(fast_sched_, gf)) {
-        std::fprintf(stderr, "[fast_decode] sched alloc failed\n");
+    // If no GPU layers are offloaded, use gallocr cached buffer pool.
+    // If GPU offload is active, use the scheduler to safely handle PCIe transfers.
+    const bool use_cpu_path = fast_decoder_cpu_ ||
+                              (n_gpu_layers_ == 0 || backend_gpu_ == nullptr);
+
+    if (use_cpu_path) {
+        if (!fast_gallocr_) {
+            fast_gallocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_cpu_));
+            if (!fast_gallocr_) {
+                std::fprintf(stderr, "[fast_decode] gallocr creation failed\n");
+                ggml_free(ctx0);
+                return false;
+            }
+        }
+
+        if (!ggml_gallocr_alloc_graph(fast_gallocr_, gf)) {
+            std::fprintf(stderr, "[fast_decode] gallocr alloc failed\n");
+            ggml_free(ctx0);
+            return false;
+        }
+
+        ggml_backend_tensor_set(hidden0, hidden_in.data(), 0, hidden_in.size() * sizeof(float));
+        ggml_backend_tensor_set(positions, pos_vals.data(), 0, pos_vals.size() * sizeof(int32_t));
+        if (prefix_ids) {
+            ggml_backend_tensor_set(prefix_ids, prefix_tokens.data(), 0, prefix_tokens.size() * sizeof(int32_t));
+        }
+
+        if (ggml_backend_graph_compute(backend_cpu_, gf) != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "[fast_decode] cpu compute failed\n");
+            ggml_free(ctx0);
+            return false;
+        }
+    } else {
         ggml_backend_sched_reset(fast_sched_);
-        ggml_free(ctx0);
-        return false;
-    }
 
-    ggml_backend_tensor_set(hidden0,   hidden_in.data(),    0, hidden_in.size() * sizeof(float));
-    ggml_backend_tensor_set(positions, pos_vals.data(),     0, pos_vals.size() * sizeof(int32_t));
-    if (prefix_ids) {
-        ggml_backend_tensor_set(prefix_ids, prefix_tokens.data(), 0,
-                                prefix_tokens.size() * sizeof(int32_t));
-    }
+        if (!ggml_backend_sched_alloc_graph(fast_sched_, gf)) {
+            std::fprintf(stderr, "[fast_decode] sched alloc failed\n");
+            ggml_backend_sched_reset(fast_sched_);
+            ggml_free(ctx0);
+            return false;
+        }
 
-    if (ggml_backend_sched_graph_compute(fast_sched_, gf) != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "[fast_decode] sched compute failed\n");
-        ggml_backend_sched_reset(fast_sched_);
-        ggml_free(ctx0);
-        return false;
+        ggml_backend_tensor_set(hidden0,   hidden_in.data(),    0, hidden_in.size() * sizeof(float));
+        ggml_backend_tensor_set(positions, pos_vals.data(),     0, pos_vals.size() * sizeof(int32_t));
+        if (prefix_ids) {
+            ggml_backend_tensor_set(prefix_ids, prefix_tokens.data(), 0, prefix_tokens.size() * sizeof(int32_t));
+        }
+
+        if (ggml_backend_sched_graph_compute(fast_sched_, gf) != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "[fast_decode] sched compute failed\n");
+            ggml_backend_sched_reset(fast_sched_);
+            ggml_free(ctx0);
+            return false;
+        }
     }
 
     logits_out.resize(hparams_.codebook_size);
     ggml_backend_tensor_get(logits, logits_out.data(), 0, hparams_.codebook_size * sizeof(float));
 
-    ggml_backend_sched_reset(fast_sched_);
+    if (!use_cpu_path) {
+        ggml_backend_sched_reset(fast_sched_);
+    }
+
     ggml_free(ctx0);
+    return true;
+}
+
+bool SlowARModel::fast_decode_batch(
+    const std::vector<float> & hidden_in,
+    int32_t semantic_code,
+    int32_t n_threads,
+    const SamplerParams & sparams,
+    std::vector<int32_t> & codebooks_out)
+{
+    if (!hparams_.has_fast_decoder) return false;
+    if (static_cast<int32_t>(hidden_in.size()) != hparams_.embedding_length) return false;
+
+    const int32_t num_cb     = hparams_.num_codebooks;          // 10
+    const int32_t n_residual = num_cb - 1;                      // 9
+    const int32_t max_prefix = num_cb;                          // 10 prefix tokens
+    const int32_t max_n_tok  = max_prefix + 1;                  // 11
+    const int32_t cb_size    = hparams_.codebook_size;
+
+    const bool use_cpu_fast = fast_decoder_cpu_ ||
+                              (n_gpu_layers_ == 0 || backend_gpu_ == nullptr);
+    if (!use_cpu_fast) {
+        codebooks_out.clear();
+        codebooks_out.reserve(n_residual);
+        std::vector<int32_t> prefix;
+        prefix.reserve(num_cb);
+        prefix.push_back(semantic_code);
+        std::vector<float> logits;
+        for (int32_t cb = 1; cb < num_cb; ++cb) {
+            if (!fast_decode(hidden_in, prefix, n_threads, logits)) {
+                for (int32_t r = cb; r < num_cb; ++r) codebooks_out.push_back(0);
+                return false;
+            }
+            int32_t cb_token = sample_token(
+                logits.data(), static_cast<int32_t>(logits.size()), sparams);
+            codebooks_out.push_back(cb_token);
+            prefix.push_back(cb_token);
+        }
+        return true;
+    }
+
+    const int32_t fast_dim  = hparams_.fast_embedding_length;
+    const int32_t n_head    = hparams_.fast_head_count;
+    const int32_t n_head_kv = hparams_.fast_head_count_kv;
+    const int32_t head_dim  = (hparams_.fast_head_dim > 0)
+                                  ? hparams_.fast_head_dim
+                                  : fast_dim / n_head;
+    const int32_t q_size    = n_head * head_dim;
+    const int32_t kv_size   = n_head_kv * head_dim;
+    const float   attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    auto build_fast_body = [&](ggml_context * ctx0,
+                               int32_t n_tok,
+                               ggml_tensor * hidden0,
+                               ggml_tensor * prefix_ids,
+                               ggml_tensor * positions) -> ggml_tensor *
+    {
+        const int32_t n_prefix = n_tok - 1;
+
+        ggml_tensor * projected = (weights_.fast_project_in != nullptr)
+            ? mul_mat_checked(ctx0, weights_.fast_project_in, hidden0, "mul_mat:fast_project_in")
+            : hidden0;
+        if (projected->type != GGML_TYPE_F32)
+            projected = ggml_cast(ctx0, projected, GGML_TYPE_F32);
+
+        ggml_tensor * x = projected;
+        if (n_prefix > 0) {
+            ggml_tensor * prefix_emb = ggml_get_rows(ctx0, weights_.fast_embeddings, prefix_ids);
+            if (prefix_emb->type != GGML_TYPE_F32)
+                prefix_emb = ggml_cast(ctx0, prefix_emb, GGML_TYPE_F32);
+            x = ggml_concat(ctx0, x, prefix_emb, 1);
+        }
+
+        for (int32_t il = 0; il < hparams_.fast_block_count; ++il) {
+            const auto & layer = weights_.fast_layers[il];
+
+            ggml_tensor * attn_in = rms_norm_weighted(ctx0, x, layer.attention_norm, hparams_.fast_rms_norm_eps);
+            ggml_tensor * qkv     = mul_mat_checked(ctx0, layer.wqkv, attn_in, "mul_mat:fast_wqkv");
+            const size_t es = ggml_element_size(qkv);
+
+            ggml_tensor * q2d = ggml_view_2d(ctx0, qkv, q_size,  n_tok, qkv->nb[1], 0);
+            ggml_tensor * k2d = ggml_view_2d(ctx0, qkv, kv_size, n_tok, qkv->nb[1], q_size * es);
+            ggml_tensor * v2d = ggml_view_2d(ctx0, qkv, kv_size, n_tok, qkv->nb[1], (q_size + kv_size) * es);
+
+            ggml_tensor * q = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q2d), head_dim, n_head,    n_tok);
+            ggml_tensor * k = ggml_reshape_3d(ctx0, ggml_cont(ctx0, k2d), head_dim, n_head_kv, n_tok);
+            ggml_tensor * v = ggml_reshape_3d(ctx0, ggml_cont(ctx0, v2d), head_dim, n_head_kv, n_tok);
+
+            if (hparams_.fast_attention_qk_norm) {
+                q = rms_norm_weighted(ctx0, q, layer.q_norm, hparams_.fast_rms_norm_eps);
+                k = rms_norm_weighted(ctx0, k, layer.k_norm, hparams_.fast_rms_norm_eps);
+            }
+
+            q = ggml_rope_ext(ctx0, q, positions, nullptr, head_dim, 0,
+                hparams_.fast_context_length, hparams_.fast_rope_freq_base,
+                1.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+            k = ggml_rope_ext(ctx0, k, positions, nullptr, head_dim, 0,
+                hparams_.fast_context_length, hparams_.fast_rope_freq_base,
+                1.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+
+            ggml_tensor * k_rep = repeat_interleave_heads(ctx0, k, n_head / n_head_kv);
+            ggml_tensor * v_rep = repeat_interleave_heads(ctx0, v, n_head / n_head_kv);
+
+            ggml_tensor * Q  = ggml_permute(ctx0, q,     0, 2, 1, 3);
+            ggml_tensor * K  = ggml_permute(ctx0, k_rep, 0, 2, 1, 3);
+            ggml_tensor * KQ = mul_mat_checked(ctx0, K, Q, "mul_mat:fast_kq");
+            ggml_tensor * KQs = ggml_scale(ctx0, KQ, attn_scale);
+            ggml_tensor * KQm = ggml_diag_mask_inf(ctx0, KQs, 0);
+            ggml_tensor * KQf = ggml_soft_max(ctx0, KQm);
+
+            ggml_tensor * V   = ggml_cont(ctx0, ggml_permute(ctx0, v_rep, 1, 2, 0, 3));
+            ggml_tensor * KQV = mul_mat_checked(ctx0, V, KQf, "mul_mat:fast_kqv");
+            ggml_tensor * KQVm = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+            ggml_tensor * attn_cur = ggml_cpy(ctx0, KQVm,
+                ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, q_size, n_tok));
+
+            ggml_tensor * attn_out = mul_mat_checked(ctx0, layer.wo, attn_cur, "mul_mat:fast_wo");
+            ggml_tensor * h     = ggml_add(ctx0, x, attn_out);
+            ggml_tensor * ff_in = rms_norm_weighted(ctx0, h, layer.ffn_norm, hparams_.fast_rms_norm_eps);
+            ggml_tensor * gate  = mul_mat_checked(ctx0, layer.w1, ff_in, "mul_mat:fast_w1");
+            ggml_tensor * up    = mul_mat_checked(ctx0, layer.w3, ff_in, "mul_mat:fast_w3");
+            ggml_tensor * ff_h  = ggml_swiglu_split(ctx0, gate, up);
+            ggml_tensor * ff_out = mul_mat_checked(ctx0, layer.w2, ff_h, "mul_mat:fast_w2");
+            x = ggml_add(ctx0, h, ff_out);
+        }
+
+        return x;
+    };
+
+    if (!fast_slot_.valid) {
+        fast_slot_buf_size_ = 16u * 1024u * 1024u;
+        fast_slot_buf_.resize(fast_slot_buf_size_);
+
+        ggml_init_params ip = { fast_slot_buf_size_, fast_slot_buf_.data(), true };
+        fast_slot_.ctx = ggml_init(ip);
+        if (!fast_slot_.ctx) return false;
+
+        ggml_context * ctx0 = fast_slot_.ctx;
+        ggml_cgraph  * gf  = ggml_new_graph_custom(ctx0, 32768, false);
+
+        ggml_tensor * hidden0    = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams_.embedding_length, 1);
+        ggml_tensor * prefix_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, max_prefix);
+        ggml_tensor * positions  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, max_n_tok);
+
+        ggml_tensor * x = build_fast_body(ctx0, max_n_tok, hidden0, prefix_ids, positions);
+
+        ggml_tensor * out  = rms_norm_weighted(ctx0, x, weights_.fast_norm, hparams_.fast_rms_norm_eps);
+        ggml_tensor * cont = ggml_cont(ctx0, out);
+        ggml_tensor * logits_all = mul_mat_checked(ctx0, weights_.fast_output, cont, "mul_mat:fast_logits_all");
+        ggml_build_forward_expand(gf, logits_all);
+
+        if (!fast_slot_.allocr) {
+            fast_slot_.allocr = ggml_gallocr_new(
+                ggml_backend_get_default_buffer_type(backend_cpu_));
+        }
+        if (!fast_slot_.allocr || !ggml_gallocr_alloc_graph(fast_slot_.allocr, gf)) {
+            ggml_free(fast_slot_.ctx);
+            fast_slot_.ctx = nullptr;
+            return false;
+        }
+
+        fast_slot_.gf         = gf;
+        fast_slot_.hidden0    = hidden0;
+        fast_slot_.prefix_ids = prefix_ids;
+        fast_slot_.positions  = positions;
+        fast_slot_.logits_all = logits_all;
+        fast_slot_.n_tokens   = max_n_tok;
+        fast_slot_.valid      = true;
+    }
+
+    auto ensure_slot = [&](int32_t n_tok) -> FastGraphSlot * {
+        if (static_cast<int32_t>(fast_slots_.size()) <= n_tok)
+            fast_slots_.resize(n_tok + 1);
+
+        auto & slot = fast_slots_[n_tok];
+        if (slot.valid) return &slot;
+
+        const int32_t n_prefix = n_tok - 1;
+
+        ggml_init_params ip = { 8u * 1024u * 1024u, nullptr, true };
+        slot.ctx = ggml_init(ip);
+        if (!slot.ctx) return nullptr;
+
+        ggml_context * ctx0 = slot.ctx;
+        ggml_cgraph  * gf  = ggml_new_graph_custom(ctx0, 32768, false);
+
+        ggml_tensor * hidden0    = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams_.embedding_length, 1);
+        ggml_tensor * prefix_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_prefix);
+        ggml_tensor * positions  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tok);
+
+        ggml_tensor * x = build_fast_body(ctx0, n_tok, hidden0, prefix_ids, positions);
+
+        ggml_tensor * out  = rms_norm_weighted(ctx0, x, weights_.fast_norm, hparams_.fast_rms_norm_eps);
+        ggml_tensor * cont = ggml_cont(ctx0, out);
+        ggml_tensor * last = ggml_cpy(ctx0,
+            last_token_view(ctx0, cont, n_tok),
+            ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, fast_dim, 1));
+        ggml_tensor * logits = mul_mat_checked(ctx0, weights_.fast_output, last, "mul_mat:fast_logits");
+        ggml_build_forward_expand(gf, logits);
+
+        slot.allocr = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend_cpu_));
+        if (!slot.allocr || !ggml_gallocr_alloc_graph(slot.allocr, gf)) {
+            ggml_free(slot.ctx);
+            slot.ctx = nullptr;
+            return nullptr;
+        }
+
+        slot.gf         = gf;
+        slot.hidden0    = hidden0;
+        slot.prefix_ids = prefix_ids;
+        slot.positions  = positions;
+        slot.logits     = logits;
+        slot.n_tokens   = n_tok;
+        slot.valid      = true;
+        return &slot;
+    };
+
+    codebooks_out.resize(n_residual);
+    std::vector<int32_t> prefix_vals(max_prefix, 0);
+    prefix_vals[0] = semantic_code;
+
+    ggml_backend_cpu_set_n_threads(backend_cpu_, resolve_n_threads(n_threads));
+
+    for (int32_t cb = 0; cb < n_residual; ++cb) {
+        const int32_t n_tok     = cb + 2;   // 2, 3, ..., 10
+        const int32_t n_prefix  = n_tok - 1;
+        const int32_t logit_pos = cb + 1;
+
+        FastGraphSlot * slot = ensure_slot(n_tok);
+
+        if (slot) {
+            std::vector<int32_t> pos_vals(n_tok);
+            for (int32_t i = 0; i < n_tok; ++i) pos_vals[i] = i;
+
+            ggml_backend_tensor_set(slot->hidden0,
+                hidden_in.data(), 0, hidden_in.size() * sizeof(float));
+            ggml_backend_tensor_set(slot->prefix_ids,
+                prefix_vals.data(), 0, n_prefix * sizeof(int32_t));
+            ggml_backend_tensor_set(slot->positions,
+                pos_vals.data(), 0, n_tok * sizeof(int32_t));
+
+            if (ggml_backend_graph_compute(backend_cpu_, slot->gf) != GGML_STATUS_SUCCESS)
+                return false;
+
+            std::vector<float> logits(cb_size);
+            ggml_backend_tensor_get(slot->logits,
+                logits.data(), 0, cb_size * sizeof(float));
+
+            codebooks_out[cb] = sample_token(logits.data(), cb_size, sparams);
+        } else {
+            std::vector<int32_t> pos_vals(max_n_tok);
+            for (int32_t i = 0; i < max_n_tok; ++i) pos_vals[i] = i;
+
+            ggml_backend_tensor_set(fast_slot_.hidden0,
+                hidden_in.data(), 0, hidden_in.size() * sizeof(float));
+            ggml_backend_tensor_set(fast_slot_.prefix_ids,
+                prefix_vals.data(), 0, max_prefix * sizeof(int32_t));
+            ggml_backend_tensor_set(fast_slot_.positions,
+                pos_vals.data(), 0, max_n_tok * sizeof(int32_t));
+
+            if (ggml_backend_graph_compute(backend_cpu_, fast_slot_.gf) != GGML_STATUS_SUCCESS)
+                return false;
+
+            std::vector<float> logits(cb_size);
+            const size_t byte_offset =
+                static_cast<size_t>(logit_pos) * cb_size * sizeof(float);
+            ggml_backend_tensor_get(fast_slot_.logits_all,
+                logits.data(), byte_offset, cb_size * sizeof(float));
+
+            codebooks_out[cb] = sample_token(logits.data(), cb_size, sparams);
+        }
+
+        if (cb + 1 < max_prefix)
+            prefix_vals[cb + 1] = codebooks_out[cb];
+    }
+
+    bool all_slots_ready = true;
+    for (int32_t n = 2; n <= max_n_tok; ++n) {
+        if (n >= static_cast<int32_t>(fast_slots_.size()) || !fast_slots_[n].valid) {
+            all_slots_ready = false;
+            break;
+        }
+    }
+    if (all_slots_ready && fast_slot_.valid) {
+        if (fast_slot_.allocr) { ggml_gallocr_free(fast_slot_.allocr); fast_slot_.allocr = nullptr; }
+        if (fast_slot_.ctx)    { ggml_free(fast_slot_.ctx);             fast_slot_.ctx    = nullptr; }
+        fast_slot_.valid = false;
+    }
+
     return true;
 }
 
