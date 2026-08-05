@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <string>
 #include <mutex>
+#include <thread>
 
 namespace s2 {
 
@@ -31,12 +32,16 @@ struct PipelineParams {
     std::string prompt_text;
     std::string prompt_audio_path;
     std::string output_path;
+    std::string kv_cache_type_k = "f16";
+    std::string kv_cache_type_v = "f16";
     GenerateParams gen;
     int32_t gpu_device = -1;
     BackendType backend_type = BackendType::CPU;
     int32_t n_gpu_layers = -1;
     bool codec_auto_backend = true;
     bool codec_follow_backend = true;
+    bool fast_decoder_cpu = false;
+    bool codebook_embeddings_cpu = false;
     int32_t stream_decode_stride_frames = 0;
     int32_t stream_holdback_frames = -1;
     int32_t codec_decode_context_frames = -1;
@@ -46,6 +51,12 @@ struct PipelineParams {
     std::string voice_id;
     bool save_voice = false;
     std::string voice_storage_dir = "./voices";
+    bool enable_vram_swap = true;
+    bool enable_hot_swap = false;   
+    bool is_persistent = false; 
+    bool more_segments_pending = false;
+    bool enable_kv_reuse = true;
+    bool kv_cache_vram = false;
 };
 
 class Pipeline {
@@ -108,8 +119,27 @@ private:
     Tokenizer* tokenizer_ref_ = &owned_tokenizer_;
     SlowARModel* model_ref_ = &owned_model_;
     AudioCodec* codec_ref_ = &owned_codec_;
+    std::thread pending_offload_thread_;
     mutable std::mutex synthesize_mutex_;
     bool initialized_ = false;
+    bool model_prefers_gpu_ = false;
+    bool codec_prefers_gpu_ = false;
+
+    struct PrefillCacheEntry {
+        std::string cache_key;
+        int32_t n_past = 0;
+        int32_t max_seq_len = 0;
+        StepResult state;
+        std::vector<uint8_t> k_data;
+        std::vector<uint8_t> v_data;
+        bool vram_resident = false;
+        bool valid = false;
+    };
+    PrefillCacheEntry prefill_cache_;
+
+    static std::string compute_prefill_cache_key(const PipelineParams & params,
+                                                  const int32_t * ref_codes,
+                                                  int32_t T_prompt);
 };
 
 }

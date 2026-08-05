@@ -1,5 +1,6 @@
 #pragma once
 
+#include "s2_mapped_file.h"
 #include "s2_backend.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -19,6 +20,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 namespace s2 {
@@ -94,20 +96,51 @@ public:
     SlowARModel();
     ~SlowARModel();
 
-    bool load(const std::string & gguf_path, int32_t gpu_device = -1, BackendType backend_type = BackendType::CPU, int32_t n_gpu_layers = -1);
+    bool load(const std::string & gguf_path, int32_t gpu_device = -1, BackendType backend_type = BackendType::CPU, int32_t n_gpu_layers = -1, bool fast_decoder_cpu = false, bool codebook_embeddings_cpu = false);
 
-    bool load_shared(gguf_context * gguf_ctx, const std::string & gguf_path, int32_t gpu_device = -1, BackendType backend_type = BackendType::CPU, int32_t n_gpu_layers = -1);
-
-    bool read_tensor_data(const std::string & gguf_path, gguf_context * gguf_ctx);
+    bool load_shared(gguf_context * gguf_ctx, const std::string & gguf_path, int32_t gpu_device = -1, BackendType backend_type = BackendType::CPU, int32_t n_gpu_layers = -1, bool fast_decoder_cpu = false, bool codebook_embeddings_cpu = false);
 
     ggml_context * weights_ctx() { return weights_.ctx_w; }
     const std::unordered_set<ggml_tensor *> & weight_tensor_set() const { return weight_tensor_set_; }
 
     bool init_kv_cache(int32_t max_seq_len);
 
+    void set_kv_cache_types(ggml_type k_type, ggml_type v_type) {
+        kv_cache_type_k_ = k_type;
+        kv_cache_type_v_ = v_type;
+    }
+
     void reset();
 
     void clear_kv_cache();
+
+    void    reset_kv_cache();
+    int32_t kv_max_seq_len() const { return max_seq_len_; }
+    int32_t n_past()           const { return n_past_; }
+    void    set_n_past(int32_t n)    { n_past_ = n; }
+    bool    save_kv_state(std::vector<uint8_t> & k_out, std::vector<uint8_t> & v_out,
+                          int32_t n_positions);
+    bool    restore_kv_state(const std::vector<uint8_t> & k_data,
+                             const std::vector<uint8_t> & v_data,
+                             int32_t n_past);
+
+    MappedFile& mapped_file() { return mapped_gguf_; }
+
+    bool allocate_and_load_weights();
+
+    bool restore_weights_to_gpu();
+
+    bool free_gpu_weights();
+
+    void free_compute_buffers();
+
+    void acquire_compute_resources();
+
+    size_t get_gpu_memory_usage_bytes() const;
+
+    bool is_weights_on_gpu() const { return weights_on_gpu_; }
+
+    bool prefers_gpu() const { return !original_gpu_weights_.empty(); }
 
 private:
     bool eval_cached(const std::vector<int32_t> & flat_tokens,
@@ -151,6 +184,20 @@ private:
     std::vector<uint8_t> fast_ctx_buf_;
 
     std::unordered_set<ggml_tensor *> weight_tensor_set_;
+
+    std::string gguf_path_;
+    size_t gguf_data_offset_ = 0;
+    std::unordered_map<ggml_tensor*, size_t> tensor_offsets_;
+    std::vector<ggml_tensor*> original_gpu_weights_;
+    std::vector<ggml_tensor*> original_cpu_weights_;
+    bool weights_on_gpu_ = false;
+    bool weights_allocated_ = false;
+    bool fast_decoder_cpu_ = false;
+    bool codebook_embeddings_cpu_ = false;
+    ggml_type kv_cache_type_k_ = GGML_TYPE_F16;
+    ggml_type kv_cache_type_v_ = GGML_TYPE_F16;
+
+    MappedFile mapped_gguf_;
 
 };
 

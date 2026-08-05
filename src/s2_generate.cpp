@@ -12,8 +12,9 @@ GenerateResult generate(
     SlowARModel & model,
     const TokenizerConfig & config,
     const PromptTensor & prompt,
-    const GenerateParams & params
-) {
+    const GenerateParams & params,
+    const StepResult * initial_state)
+{
     const auto generate_t0 = std::chrono::steady_clock::now();
     GenerateResult out;
     out.num_codebooks = model.hparams().num_codebooks;
@@ -34,25 +35,31 @@ GenerateResult generate(
         sem_mask[im_end_id] = 0.0f;
     }
 
-    const int32_t rows = prompt.rows;
-    const int32_t cols = prompt.cols;
-    std::vector<int32_t> prompt_tm(static_cast<size_t>(rows) * cols);
-    for (int32_t r = 0; r < rows; ++r) {
-        for (int32_t c = 0; c < cols; ++c) {
-            prompt_tm[static_cast<size_t>(c) * rows + r] = prompt.data[static_cast<size_t>(r) * cols + c];
-        }
-    }
-
     StepResult state;
-    if (params.verbose && log_enabled(LogLevel::Info)) {
-        std::cout << "[Generate] Prefilling " << prompt.cols << " tokens..." << std::endl;
+    double prefill_ms = 0.0;
+
+    if (initial_state) {
+        state = *initial_state;
+    } else {
+        const int32_t rows = prompt.rows;
+        const int32_t cols = prompt.cols;
+        std::vector<int32_t> prompt_tm(static_cast<size_t>(rows) * cols);
+        for (int32_t r = 0; r < rows; ++r)
+            for (int32_t c = 0; c < cols; ++c)
+                prompt_tm[static_cast<size_t>(c) * rows + r] =
+                    prompt.data[static_cast<size_t>(r) * cols + c];
+
+        if (params.verbose && log_enabled(LogLevel::Info))
+            std::cout << "[Generate] Prefilling " << prompt.cols << " tokens..." << std::endl;
+
+        const auto prefill_t0 = std::chrono::steady_clock::now();
+        if (!model.prefill_fast(prompt_tm, prompt.cols, params.n_threads, state)) {
+            std::cerr << "[Generate] Prefill failed." << std::endl;
+            return out;
+        }
+        const auto prefill_t1 = std::chrono::steady_clock::now();
+        prefill_ms = std::chrono::duration<double, std::milli>(prefill_t1 - prefill_t0).count();
     }
-    const auto prefill_t0 = std::chrono::steady_clock::now();
-    if (!model.prefill_fast(prompt_tm, prompt.cols, params.n_threads, state)) {
-        std::cerr << "[Generate] Prefill failed." << std::endl;
-        return out;
-    }
-    const auto prefill_t1 = std::chrono::steady_clock::now();
 
     auto apply_mask_and_sample = [&](const std::vector<float> & logits,
                                      bool block_im_end) -> int32_t {
@@ -183,14 +190,17 @@ GenerateResult generate(
     }
 
     if (params.verbose && log_enabled(LogLevel::Info)) {
-        const auto loop_t1 = std::chrono::steady_clock::now();
+        const auto loop_t1     = std::chrono::steady_clock::now();
         const auto generate_t1 = std::chrono::steady_clock::now();
-        const double prefill_ms = std::chrono::duration<double, std::milli>(prefill_t1 - prefill_t0).count();
-        const double loop_ms = std::chrono::duration<double, std::milli>(loop_t1 - loop_t0).count();
+
+        const double loop_ms = std::chrono::duration<double, std::milli>(
+            loop_t1 - loop_t0).count();
         const double total_ms = std::chrono::duration<double, std::milli>(generate_t1 - generate_t0).count();
         const double ms_per_frame = out.n_frames > 0 ? (loop_ms / out.n_frames) : 0.0;
         std::cout << std::endl;
-        std::cout << "[Generate] Done: " << out.n_frames << " frames generated." << std::endl;
+        std::cout << "[Generate] Done: " << out.n_frames
+                  << " frames generated."
+                  << (initial_state ? " (prefill cached)" : "") << std::endl;
         std::cout << "[Metrics] Generate: prefill=" << prefill_ms
                   << " ms, loop=" << loop_ms
                   << " ms, total=" << total_ms

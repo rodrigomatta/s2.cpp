@@ -1,5 +1,6 @@
 #include "../include/s2_model.h"
 #include "../include/s2_log.h"
+#include "../include/s2_mapped_file.h"
 #include "s2_ggml_utils.h"
 #include <iostream>
 #include <vector>
@@ -105,6 +106,14 @@ static bool allocate_weight_buffers(ggml_backend_t backend,
                                     size_t & max_buffer_bytes,
                                     std::string & error_message) {
     free_backend_buffers(out_buffers);
+
+    for (ggml_tensor * tensor : tensors) {
+        if (tensor) {
+            tensor->data   = nullptr;
+            tensor->buffer = nullptr;
+        }
+    }
+
     total_bytes = 0;
     max_buffer_bytes = 0;
     error_message.clear();
@@ -201,7 +210,7 @@ SlowARModel::~SlowARModel() {
     weights_.ctx_w = nullptr;
 }
 
-bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_path, int32_t gpu_device, BackendType backend_type, int32_t n_gpu_layers) {
+bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_path, int32_t gpu_device, BackendType backend_type, int32_t n_gpu_layers, bool fast_decoder_cpu, bool codebook_embeddings_cpu) {
 
     backend_cpu_ = ggml_backend_cpu_init();
     if (!backend_cpu_) {
@@ -217,6 +226,8 @@ bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_
     }
 
     gguf_free(local_gguf);
+    gguf_path_ = gguf_path;
+    gguf_data_offset_ = gguf_get_data_offset(ctx_gguf);
 
     S2_LOG_INFO_STREAM("[Model] Reading metadata from " << gguf_path << std::endl);
 
@@ -310,6 +321,9 @@ bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_
         n_gpu_layers = hparams_.block_count;
     }
     n_gpu_layers_ = n_gpu_layers;
+    fast_decoder_cpu_ = fast_decoder_cpu;
+    codebook_embeddings_cpu_ = codebook_embeddings_cpu;
+
     S2_LOG_INFO_STREAM("[Model] GPU layers: " << n_gpu_layers_ << " / " << hparams_.block_count << std::endl);
 
     if (n_gpu_layers_ > 0 && wants_gpu_backend) {
@@ -478,12 +492,30 @@ bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_
 
     weight_tensor_set_.insert(weight_tensors.begin(), weight_tensors.end());
 
+    const int64_t n_tensors_gguf = gguf_get_n_tensors(ctx_gguf);
+    for (int64_t ti = 0; ti < n_tensors_gguf; ++ti) {
+        const char * tname = gguf_get_tensor_name(ctx_gguf, ti);
+        ggml_tensor * t = ggml_get_tensor(weights_.ctx_w, tname);
+        if (t && weight_tensor_set_.find(t) != weight_tensor_set_.end()) {
+            tensor_offsets_[t] = gguf_get_tensor_offset(ctx_gguf, ti);
+        }
+    }
+
     const bool full_model_offload =
         backend_gpu_ != nullptr &&
         backend_type != BackendType::CUDA &&
         n_gpu_layers_ == hparams_.block_count;
 
     auto get_weight_backend = [&](const std::string & name) -> ggml_backend_t {
+        if (fast_decoder_cpu_ &&
+            (name.rfind("fast_layers.", 0) == 0 ||
+            name.rfind("fast_", 0) == 0)) {
+            return backend_cpu_;
+        }
+
+        if (codebook_embeddings_cpu_ && name == "codebook_embeddings.weight") {
+            return backend_cpu_;
+        }
 
         if (full_model_offload) {
             return backend_gpu_;
@@ -521,196 +553,39 @@ bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_
         }
     }
 
-    std::vector<ggml_backend_buffer_t> gpu_buffers;
-    std::vector<ggml_backend_buffer_t> cpu_buffers;
+    original_gpu_weights_ = gpu_weight_tensors;
+    original_cpu_weights_ = cpu_weight_tensors;
 
-    if (!gpu_weight_tensors.empty() && backend_gpu_) {
-        size_t gpu_bytes = 0;
-        size_t gpu_max_buffer = 0;
-        std::string gpu_alloc_error;
-        if (!allocate_weight_buffers(
-                backend_gpu_,
-                gpu_weight_tensors,
-                gpu_buffers,
-                gpu_bytes,
-                gpu_max_buffer,
-                gpu_alloc_error)) {
-            const double requested_mb = gpu_bytes / (1024.0 * 1024.0);
-            const double max_chunk_mb =
-                gpu_max_buffer == static_cast<size_t>(-1)
-                    ? 0.0
-                    : gpu_max_buffer / (1024.0 * 1024.0);
-            std::cerr << "[Model] GPU weight buffer allocation failed." << std::endl;
-            std::cerr << "[Model] Requested GPU memory: " << requested_mb << " MB for "
-                      << gpu_weight_tensors.size() << " tensors (" << n_gpu_layers_
-                      << " layers)" << std::endl;
-            if (gpu_max_buffer != static_cast<size_t>(-1)) {
-                std::cerr << "[Model] Backend max buffer size: " << max_chunk_mb
-                          << " MB per allocation." << std::endl;
-            }
-            if (!gpu_alloc_error.empty()) {
-                std::cerr << "[Model] " << gpu_alloc_error << std::endl;
-            }
-            std::cerr << "[Model] Suggest using a lower --gpu-layers value (e.g., --gpu-layers "
-                      << std::max(1, n_gpu_layers_ / 2) << ")" << std::endl;
-            return false;
-        }
-    }
-
-    if (!cpu_weight_tensors.empty()) {
-        size_t cpu_bytes = 0;
-        size_t cpu_max_buffer = 0;
-        std::string cpu_alloc_error;
-        if (!allocate_weight_buffers(
-                backend_cpu_,
-                cpu_weight_tensors,
-                cpu_buffers,
-                cpu_bytes,
-                cpu_max_buffer,
-                cpu_alloc_error)) {
-            free_backend_buffers(gpu_buffers);
-            std::cerr << "[Model] Failed to allocate CPU weight buffer." << std::endl;
-            if (!cpu_alloc_error.empty()) {
-                std::cerr << "[Model] " << cpu_alloc_error << std::endl;
-            }
-            return false;
-        }
-    }
-
-    weights_.model_bufs_gpu = std::move(gpu_buffers);
-    weights_.model_bufs_cpu = std::move(cpu_buffers);
-
-    {
-        ggml_backend_t backends[2];
-        int n_backends;
-        if (backend_gpu_) {
-            backends[0] = backend_gpu_;
-            backends[1] = backend_cpu_;
-            n_backends = 2;
-        } else {
-            backends[0] = backend_cpu_;
-            n_backends = 1;
-        }
-
-        sched_ = ggml_backend_sched_new(backends, NULL, n_backends, 32768, false, true);
-        if (!sched_) {
-            std::cerr << "[Model] Failed to create Slow-AR scheduler." << std::endl;
-            return false;
-        }
-
-        if (hparams_.has_fast_decoder) {
-            fast_sched_ = ggml_backend_sched_new(backends, NULL, n_backends, 16384, false, true);
-            if (!fast_sched_) {
-                std::cerr << "[Model] Failed to create Fast-AR scheduler." << std::endl;
-                return false;
-            }
-        }
-    }
-
-    if (n_gpu_layers_ > 0 && backend_gpu_) {
-        const int32_t first_cpu_layer = n_gpu_layers_;
-        const int32_t last_gpu_layer = n_gpu_layers_ - 1;
-        if (first_cpu_layer < hparams_.block_count) {
-            S2_LOG_INFO_STREAM("[Model] Layers 0-" << last_gpu_layer << " on "
-                      << ggml_backend_name(backend_gpu_)
-                      << ", " << first_cpu_layer << "-" << (hparams_.block_count - 1) << " on CPU"
-                      << std::endl);
-        } else {
-            S2_LOG_INFO_STREAM("[Model] Layers 0-" << (hparams_.block_count - 1) << " on "
-                      << ggml_backend_name(backend_gpu_) << " (all)" << std::endl);
-        }
-    } else {
-        S2_LOG_INFO_STREAM("[Model] All " << hparams_.block_count << " layers on CPU" << std::endl);
-    }
-
-    const size_t gpu_weight_bytes = total_backend_buffer_bytes(weights_.model_bufs_gpu);
-    if (!weights_.model_bufs_gpu.empty()) {
-        S2_LOG_INFO_STREAM("[Model] GPU weight buffers: " << weights_.model_bufs_gpu.size()
-                  << " chunk(s), " << (gpu_weight_bytes / 1024.0 / 1024.0)
-                  << " MB total" << std::endl);
-    }
-    const size_t cpu_weight_bytes = total_backend_buffer_bytes(weights_.model_bufs_cpu);
-    if (!weights_.model_bufs_cpu.empty()) {
-        S2_LOG_INFO_STREAM("[Model] CPU weight buffers: " << weights_.model_bufs_cpu.size()
-                  << " chunk(s), " << (cpu_weight_bytes / 1024.0 / 1024.0)
-                  << " MB total" << std::endl);
-    }
-    const size_t total_bytes = gpu_weight_bytes + cpu_weight_bytes;
-    S2_LOG_INFO_STREAM("[Model] Total model size: "
-              << (total_bytes / 1024.0 / 1024.0) << " MB" << std::endl);
-
-    S2_LOG_INFO_STREAM("[Model] KV cache: " << (n_gpu_layers_ > 0 && backend_gpu_ ? "GPU" : "CPU")
-              << ", n_gpu_layers=" << n_gpu_layers_ << std::endl);
-
-    if (backend_type == BackendType::CUDA &&
-        backend_gpu_ &&
-        ggml_is_quantized(weights_.embeddings->type)) {
-        S2_LOG_INFO_STREAM("[Model] Keeping quantized embedding tables on CPU for CUDA stability."
-                  << std::endl);
-    }
-
-    return true;
-}
-
-bool SlowARModel::read_tensor_data(const std::string & gguf_path, gguf_context * ctx_gguf) {
-    const size_t data_offset = gguf_get_data_offset(ctx_gguf);
-    const int64_t n_tensors  = gguf_get_n_tensors(ctx_gguf);
-
-    std::FILE * f = std::fopen(gguf_path.c_str(), "rb");
-    if (!f) {
-        std::cerr << "[Model] Cannot reopen " << gguf_path << " for data loading." << std::endl;
+    mapped_gguf_.open(gguf_path);
+    if (!mapped_gguf_.is_open()) {
+        std::cerr << "[Model] Failed to mmap " << gguf_path << std::endl;
         return false;
     }
-    std::vector<uint8_t> tmp;
-    for (int64_t ti = 0; ti < n_tensors; ++ti) {
-        const char * tname = gguf_get_tensor_name(ctx_gguf, ti);
-        ggml_tensor * t = ggml_get_tensor(weights_.ctx_w, tname);
 
-        if (!t || weight_tensor_set_.find(t) == weight_tensor_set_.end()) continue;
+    weights_allocated_ = false;
+    weights_on_gpu_ = false;
+    
 
-        const size_t toff  = data_offset + gguf_get_tensor_offset(ctx_gguf, ti);
-        const size_t tsize = ggml_nbytes(t);
-        if (tmp.size() < tsize) tmp.resize(tsize);
-#ifdef _WIN32
-        _fseeki64(f, (int64_t)toff, SEEK_SET);
-#else
-        fseeko(f, (off_t)toff, SEEK_SET);
-#endif
-        if (std::fread(tmp.data(), 1, tsize, f) != tsize) {
-            std::cerr << "[Model] Failed to read tensor: " << tname << std::endl;
-            std::fclose(f);
-            return false;
-        }
-        ggml_backend_tensor_set(t, tmp.data(), 0, tsize);
-    }
-    tmp.clear();
-    tmp.shrink_to_fit();
-    std::fclose(f);
-
-    S2_LOG_INFO_STREAM("[Model] Weights loaded. Total tensors: " << n_tensors << std::endl);
     return true;
 }
 
-bool SlowARModel::load(const std::string & gguf_path, int32_t gpu_device, BackendType backend_type, int32_t n_gpu_layers) {
-
+bool SlowARModel::load(const std::string & gguf_path, int32_t gpu_device, BackendType backend_type, int32_t n_gpu_layers, bool fast_decoder_cpu, bool codebook_embeddings_cpu) {
     struct gguf_init_params params = { true, nullptr };
     gguf_context * ctx_gguf = gguf_init_from_file(gguf_path.c_str(), params);
     if (!ctx_gguf) {
         std::cerr << "[Model] Failed to load GGUF from " << gguf_path << std::endl;
         return false;
     }
-
-    if (!load_shared(ctx_gguf, gguf_path, gpu_device, backend_type, n_gpu_layers)) {
+    if (!load_shared(ctx_gguf, gguf_path, gpu_device, backend_type, n_gpu_layers, fast_decoder_cpu, codebook_embeddings_cpu)) {
         gguf_free(ctx_gguf);
         return false;
     }
-
-    if (!read_tensor_data(gguf_path, ctx_gguf)) {
-        gguf_free(ctx_gguf);
-        return false;
-    }
-
     gguf_free(ctx_gguf);
+    
+    if (!allocate_and_load_weights()) {
+        std::cerr << "[Model] Failed to allocate and load weights from mmap." << std::endl;
+        return false;
+    }
     return true;
 }
 
@@ -743,8 +618,9 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
         return false;
     }
 
-    memory_k_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, n_head_kv, max_seq_len, n_layer);
-    memory_v_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, n_head_kv, max_seq_len, n_layer);
+    // Layout for flash attention
+    memory_k_ = ggml_new_tensor_4d(ctx_kv_, kv_cache_type_k_, head_dim, max_seq_len, n_head_kv, n_layer);
+    memory_v_ = ggml_new_tensor_4d(ctx_kv_, kv_cache_type_v_, head_dim, max_seq_len, n_head_kv, n_layer);
 
     ggml_backend_t kv_backend = (n_gpu_layers_ > 0 && backend_gpu_) ? backend_gpu_ : backend_cpu_;
     kv_buf_ = ggml_backend_alloc_ctx_tensors(ctx_kv_, kv_backend);
@@ -757,9 +633,11 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
     ggml_backend_tensor_memset(memory_v_, 0, 0, ggml_nbytes(memory_v_));
 
     S2_LOG_INFO_STREAM("[Model] KV cache allocated on "
-              << (n_gpu_layers_ > 0 && backend_gpu_ ? ggml_backend_name(backend_gpu_) : "CPU")
-              << ", size: " << (ggml_backend_buffer_get_size(kv_buf_) / 1024.0 / 1024.0)
-              << " MB" << std::endl);
+        << (n_gpu_layers_ > 0 && backend_gpu_ ? ggml_backend_name(backend_gpu_) : "CPU")
+        << ", K=" << ggml_type_name(kv_cache_type_k_)
+        << ", V=" << ggml_type_name(kv_cache_type_v_)
+        << ", size: " << (ggml_backend_buffer_get_size(kv_buf_) / 1024.0 / 1024.0)
+        << " MB" << std::endl);
 
     return true;
 }
@@ -785,6 +663,93 @@ void SlowARModel::clear_kv_cache() {
     max_seq_len_ = 0;
     n_past_ = 0;
 }
+void SlowARModel::reset_kv_cache() {
+    if (memory_k_ && kv_buf_) {
+        ggml_backend_tensor_memset(memory_k_, 0, 0, ggml_nbytes(memory_k_));
+        ggml_backend_tensor_memset(memory_v_, 0, 0, ggml_nbytes(memory_v_));
+    }
+    n_past_ = 0;
+}
+
+bool SlowARModel::save_kv_state(std::vector<uint8_t> & k_out,
+                                std::vector<uint8_t> & v_out,
+                                int32_t n_positions) {
+    if (!memory_k_ || !memory_v_ || n_positions <= 0) return false;
+    if (n_positions > max_seq_len_) return false;
+
+    const int32_t n_layer   = hparams_.block_count;
+    const int32_t n_head_kv = hparams_.head_count_kv;
+
+    const size_t k_pos_bytes = static_cast<size_t>(n_positions) * memory_k_->nb[1];
+    const size_t v_pos_bytes = static_cast<size_t>(n_positions) * memory_v_->nb[1];
+    const size_t k_out_bytes = static_cast<size_t>(n_layer) * n_head_kv * k_pos_bytes;
+    const size_t v_out_bytes = static_cast<size_t>(n_layer) * n_head_kv * v_pos_bytes;
+
+    const size_t k_full_bytes = ggml_nbytes(memory_k_);
+    const size_t v_full_bytes = ggml_nbytes(memory_v_);
+    std::vector<uint8_t> k_full(k_full_bytes);
+    std::vector<uint8_t> v_full(v_full_bytes);
+    ggml_backend_tensor_get(memory_k_, k_full.data(), 0, k_full_bytes);
+    ggml_backend_tensor_get(memory_v_, v_full.data(), 0, v_full_bytes);
+
+    k_out.resize(k_out_bytes);
+    v_out.resize(v_out_bytes);
+    size_t k_off = 0, v_off = 0;
+    for (int32_t l = 0; l < n_layer; ++l) {
+        for (int32_t h = 0; h < n_head_kv; ++h) {
+            const size_t k_src = static_cast<size_t>(l) * memory_k_->nb[3]
+                               + static_cast<size_t>(h) * memory_k_->nb[2];
+            const size_t v_src = static_cast<size_t>(l) * memory_v_->nb[3]
+                               + static_cast<size_t>(h) * memory_v_->nb[2];
+            std::memcpy(k_out.data() + k_off, k_full.data() + k_src, k_pos_bytes);
+            std::memcpy(v_out.data() + v_off, v_full.data() + v_src, v_pos_bytes);
+            k_off += k_pos_bytes;
+            v_off += v_pos_bytes;
+        }
+    }
+    return true;
+}
+
+bool SlowARModel::restore_kv_state(const std::vector<uint8_t> & k_data,
+                                   const std::vector<uint8_t> & v_data,
+                                   int32_t n_past) {
+    if (!memory_k_ || !memory_v_) return false;
+
+    const int32_t n_layer   = hparams_.block_count;
+    const int32_t n_head_kv = hparams_.head_count_kv;
+
+    const size_t k_pos_bytes = static_cast<size_t>(n_past) * memory_k_->nb[1];
+    const size_t v_pos_bytes = static_cast<size_t>(n_past) * memory_v_->nb[1];
+    const size_t k_expected  = static_cast<size_t>(n_layer) * n_head_kv * k_pos_bytes;
+    const size_t v_expected  = static_cast<size_t>(n_layer) * n_head_kv * v_pos_bytes;
+    if (k_data.size() != k_expected || v_data.size() != v_expected) return false;
+
+    const size_t k_full_bytes = ggml_nbytes(memory_k_);
+    const size_t v_full_bytes = ggml_nbytes(memory_v_);
+    std::vector<uint8_t> k_full(k_full_bytes, 0);
+    std::vector<uint8_t> v_full(v_full_bytes, 0);
+
+    size_t k_in = 0, v_in = 0;
+    for (int32_t l = 0; l < n_layer; ++l) {
+        for (int32_t h = 0; h < n_head_kv; ++h) {
+            const size_t k_dst = static_cast<size_t>(l) * memory_k_->nb[3]
+                               + static_cast<size_t>(h) * memory_k_->nb[2];
+            const size_t v_dst = static_cast<size_t>(l) * memory_v_->nb[3]
+                               + static_cast<size_t>(h) * memory_v_->nb[2];
+            std::memcpy(k_full.data() + k_dst, k_data.data() + k_in, k_pos_bytes);
+            std::memcpy(v_full.data() + v_dst, v_data.data() + v_in, v_pos_bytes);
+            k_in += k_pos_bytes;
+            v_in += v_pos_bytes;
+        }
+    }
+
+    ggml_backend_tensor_set(memory_k_, k_full.data(), 0, k_full_bytes);
+    ggml_backend_tensor_set(memory_v_, v_full.data(), 0, v_full_bytes);
+
+    n_past_ = n_past;
+    return true;
+}
+
 bool SlowARModel::prefill_fast(const std::vector<int32_t> & flat_tokens, int32_t n_tokens,
                           int32_t n_threads, StepResult & result) {
     return eval_cached(flat_tokens, n_tokens, n_threads, result);
@@ -1251,6 +1216,122 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
 
     ggml_backend_sched_reset(fast_sched_);
     ggml_free(ctx0);
+    return true;
+}
+
+bool SlowARModel::restore_weights_to_gpu() {
+    if (!backend_gpu_ || weights_on_gpu_) return true;
+    S2_LOG_INFO_STREAM("[Model] >>> RESTORING Slow-AR weights from mmap to GPU..." << std::endl);
+    const auto t0 = std::chrono::steady_clock::now();
+    weights_allocated_ = false;
+    if (!allocate_and_load_weights()) return false;
+    const auto t1 = std::chrono::steady_clock::now();
+    const double restore_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    S2_LOG_INFO_STREAM("[Model] <<< Slow-AR weights RESTORED in " << restore_ms << " ms" << std::endl);
+    return true;
+}
+
+bool SlowARModel::free_gpu_weights() {
+    if (!backend_gpu_ || !weights_on_gpu_) return true;
+    
+    S2_LOG_INFO_STREAM("[Model] >>> FREEING Slow-AR GPU weights" << std::endl);
+    const auto t0 = std::chrono::steady_clock::now();
+    
+    ggml_backend_synchronize(backend_gpu_);
+
+    free_backend_buffers(weights_.model_bufs_gpu);
+    weights_.model_bufs_gpu.clear();
+    
+    for (ggml_tensor * t : original_gpu_weights_) {
+        if (t) { t->data = nullptr; t->buffer = nullptr; }
+    }
+    
+    weights_allocated_ = false;
+    weights_on_gpu_ = false;
+    const auto t1 = std::chrono::steady_clock::now();
+    const double free_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    S2_LOG_INFO_STREAM("[Model] <<< Slow-AR GPU weights FREED in " << free_ms << " ms" << std::endl);
+    return true;
+}
+
+void SlowARModel::free_compute_buffers() {
+    if (backend_gpu_) ggml_backend_synchronize(backend_gpu_);
+    clear_kv_cache();
+    if (sched_) {
+        ggml_backend_sched_free(sched_);
+        sched_ = nullptr;
+    }
+    if (fast_sched_) {
+        ggml_backend_sched_free(fast_sched_);
+        fast_sched_ = nullptr;
+    }
+}
+
+void SlowARModel::acquire_compute_resources() {
+    if (sched_) return;
+    
+    ggml_backend_t backends[2];
+    int n_backends;
+    if (backend_gpu_) {
+        backends[0] = backend_gpu_;
+        backends[1] = backend_cpu_;
+        n_backends = 2;
+    } else {
+        backends[0] = backend_cpu_;
+        n_backends = 1;
+    }
+    
+    sched_ = ggml_backend_sched_new(backends, NULL, n_backends, 32768, false, true);
+    if (hparams_.has_fast_decoder) {
+        fast_sched_ = ggml_backend_sched_new(backends, NULL, n_backends, 16384, false, true);
+    }
+}
+
+size_t SlowARModel::get_gpu_memory_usage_bytes() const {
+    size_t total = 0;
+    
+    for (const auto & buf : weights_.model_bufs_gpu) {
+        if (buf) total += ggml_backend_buffer_get_size(buf);
+    }
+    
+    if (kv_buf_) {
+        total += ggml_backend_buffer_get_size(kv_buf_);
+    }
+    
+    return total;
+}
+
+bool SlowARModel::allocate_and_load_weights() {
+    if (weights_allocated_) return true;
+    if (!mapped_gguf_.is_open()) return false;
+
+    size_t b, m; std::string e;
+    if (!original_gpu_weights_.empty() && backend_gpu_) {
+        if (!allocate_weight_buffers(backend_gpu_, original_gpu_weights_, weights_.model_bufs_gpu, b, m, e)) {
+            std::cerr << "[Model] GPU alloc failed: " << e << std::endl; return false;
+        }
+    }
+    if (!original_cpu_weights_.empty()) {
+        if (!allocate_weight_buffers(backend_cpu_, original_cpu_weights_, weights_.model_bufs_cpu, b, m, e)) {
+            std::cerr << "[Model] CPU alloc failed: " << e << std::endl; return false;
+        }
+    }
+
+    const uint8_t* base = mapped_gguf_.data();
+    for (ggml_tensor * t : original_gpu_weights_) {
+        auto it = tensor_offsets_.find(t);
+        if (it != tensor_offsets_.end())
+            ggml_backend_tensor_set(t, base + gguf_data_offset_ + it->second, 0, ggml_nbytes(t));
+    }
+    for (ggml_tensor * t : original_cpu_weights_) {
+        auto it = tensor_offsets_.find(t);
+        if (it != tensor_offsets_.end())
+            ggml_backend_tensor_set(t, base + gguf_data_offset_ + it->second, 0, ggml_nbytes(t));
+    }
+
+    weights_allocated_ = true;
+    weights_on_gpu_ = !original_gpu_weights_.empty();
+    acquire_compute_resources();
     return true;
 }
 

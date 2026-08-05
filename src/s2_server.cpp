@@ -234,6 +234,7 @@ static bool synthesize_segmented_to_sink(s2::Pipeline & pipeline,
         s2::PipelineParams segment_params = base_params;
         segment_params.text = segments[i];
         segment_params.prompt_text = effective_prompt_text;
+        segment_params.more_segments_pending = (i + 1 < segments.size());
 
         std::vector<float> audio_out;
         const bool ok = pipeline.synthesize_with_prompt_codes(
