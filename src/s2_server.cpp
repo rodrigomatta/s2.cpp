@@ -67,6 +67,11 @@ static std::string trim_copy(const std::string & value) {
     return value.substr(begin, end - begin);
 }
 
+static int64_t epoch_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 static std::vector<std::string> split_sentences_basic(const std::string & text) {
     std::vector<std::string> segments;
     std::string current;
@@ -725,12 +730,14 @@ namespace s2
                 if (!stream_response && !segment_sentences) {
                     void * wav_buffer = nullptr;
                     size_t wav_size = 0;
+                    const int64_t synth_start_ms = epoch_ms();
                     const bool ok = pipeline->synthesize_to_memory(
                         pipelineParams,
                         ref_audio_buffer,
                         ref_audio_size,
                         &wav_buffer,
                         &wav_size);
+                    const int64_t synth_end_ms = epoch_ms();
 
                     if (!ok) {
                         release_busy();
@@ -739,6 +746,8 @@ namespace s2
                         return;
                     }
 
+                    res.set_header("X-Synthesis-Start", std::to_string(synth_start_ms));
+                    res.set_header("X-Synthesis-Duration-Ms", std::to_string(synth_end_ms - synth_start_ms));
                     res.set_header("Content-Disposition", "attachment; filename=\"generated_audio.wav\"");
                     res.set_content(std::string(reinterpret_cast<const char *>(wav_buffer), wav_size),
                                     "audio/wav");
@@ -757,10 +766,12 @@ namespace s2
 
                 if (!chunked_response) {
                     BufferedAudioSink sink(stream_audio_format);
+                    const int64_t synth_start_ms = epoch_ms();
                     const bool ok = segment_sentences
                         ? synthesize_segmented_to_sink(*pipeline, pipelineParams, ref_audio,
                                                        segmented_texts, sentence_pause_ms, sink)
                         : pipeline->synthesize_streaming_raw(pipelineParams, ref_audio, sink);
+                    const int64_t synth_end_ms = epoch_ms();
                     release_busy();
 
                     if (!ok || !sink.ok()) {
@@ -771,6 +782,8 @@ namespace s2
                         return;
                     }
 
+                    res.set_header("X-Synthesis-Start", std::to_string(synth_start_ms));
+                    res.set_header("X-Synthesis-Duration-Ms", std::to_string(synth_end_ms - synth_start_ms));
                     const auto & audio_bytes = sink.bytes();
                     res.set_header(
                         "Content-Disposition",
