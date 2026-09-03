@@ -1,14 +1,91 @@
 diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
-index d208acf2..bdec4a43 100644
 --- a/ggml/src/ggml-cuda/cpy.cu
 +++ b/ggml/src/ggml-cuda/cpy.cu
-@@ -405,7 +405,8 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
+@@ -52,42 +52,53 @@ static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const
+     const int64_t n = ne00 * ne01;
  
-     const bool contiguous_srcs = ggml_is_contiguous(src0) && ggml_is_contiguous(src1);
-     const bool can_be_transposed = nb01 == (int64_t)ggml_element_size(src0) &&
--        src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0);
-+        src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0) &&
-+        (ne00 + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D < USHRT_MAX;
+     const int x = blockIdx.x * CUDA_CPY_TILE_DIM_2D + threadIdx.x;
+-    const int y = blockIdx.y * CUDA_CPY_TILE_DIM_2D + threadIdx.y;
+-    const int tx = blockIdx.y * CUDA_CPY_TILE_DIM_2D + threadIdx.x;  // transpose block offset
+     const int ty = blockIdx.x * CUDA_CPY_TILE_DIM_2D + threadIdx.y;
  
-     if (src0->type == src1->type && contiguous_srcs) {
-         GGML_ASSERT(ggml_nbytes(src0) == ggml_nbytes(src1));
+     __shared__ float tile[2][CUDA_CPY_TILE_DIM_2D][CUDA_CPY_TILE_DIM_2D+1];
+     int cur_tile_buf = 0;
+ 
++    // Grid-stride over the ne00 (row) tile dimension so gridDim.y never needs to
++    // exceed USHRT_MAX for very tall transposes (e.g. codec [length, channels] ->
++    // [channels, length] with length > 2M). blockIdx.y is only a starting tile.
++    const int64_t grid_y = (ne00 + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
++
++    for (int64_t by = blockIdx.y; by < grid_y; by += gridDim.y) {
++        const int y  = (int) by * CUDA_CPY_TILE_DIM_2D + threadIdx.y;
++        const int tx = (int) by * CUDA_CPY_TILE_DIM_2D + threadIdx.x;  // transpose block offset
++
++        cur_tile_buf = 0;
++        __syncthreads();
++
+ #pragma unroll
+-    for (int i = 0; i < CUDA_CPY_BLOCK_NM; ++i) {
++        for (int i = 0; i < CUDA_CPY_BLOCK_NM; ++i) {
+ 
+-        const unsigned int imat = blockIdx.z * CUDA_CPY_BLOCK_NM + i;
+-        if (imat >= nmat)
+-            break;
++            const unsigned int imat = blockIdx.z * CUDA_CPY_BLOCK_NM + i;
++            if (imat >= nmat)
++                break;
+ 
+ #pragma unroll
+-        for (int j = 0; j < CUDA_CPY_TILE_DIM_2D; j += CUDA_CPY_BLOCK_ROWS) {
+-            if(x < ne01 && y + j < ne00){
+-                const int row = threadIdx.y+j;
+-                const int col = threadIdx.x * sizeof(float)/sizeof(T);
+-                T *tile2 = reinterpret_cast<T*>(tile[cur_tile_buf][row]);
+-                tile2[col] = src[imat*n + (y+j)*ne01 + x];
++            for (int j = 0; j < CUDA_CPY_TILE_DIM_2D; j += CUDA_CPY_BLOCK_ROWS) {
++                if(x < ne01 && y + j < ne00){
++                    const int row = threadIdx.y+j;
++                    const int col = threadIdx.x * sizeof(float)/sizeof(T);
++                    T *tile2 = reinterpret_cast<T*>(tile[cur_tile_buf][row]);
++                    tile2[col] = src[imat*n + (y+j)*ne01 + x];
++                }
+             }
+-        }
+ 
+-        __syncthreads();
++            __syncthreads();
+ 
+ #pragma unroll
+-        for (int j = 0; j < CUDA_CPY_TILE_DIM_2D; j += CUDA_CPY_BLOCK_ROWS) {
+-            if (ty + j < ne01 && tx < ne00) {
+-                const int col = (threadIdx.y+j)*sizeof(float)/sizeof(T);
+-                const T *tile2 = reinterpret_cast<const T*>(tile[cur_tile_buf][threadIdx.x]);
+-                dst[imat*n + (ty+j)*ne00 + tx] = tile2[col];
++            for (int j = 0; j < CUDA_CPY_TILE_DIM_2D; j += CUDA_CPY_BLOCK_ROWS) {
++                if (ty + j < ne01 && tx < ne00) {
++                    const int col = (threadIdx.y+j)*sizeof(float)/sizeof(T);
++                    const T *tile2 = reinterpret_cast<const T*>(tile[cur_tile_buf][threadIdx.x]);
++                    dst[imat*n + (ty+j)*ne00 + tx] = tile2[col];
++                }
+             }
+-        }
+ 
+-        cur_tile_buf = (cur_tile_buf + 1) % 2;
++            cur_tile_buf = (cur_tile_buf + 1) % 2;
++        }
+     }
+ 
+     GGML_UNUSED_VARS(ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11,
+@@ -219,9 +230,10 @@ static void ggml_cpy_scalar_cuda(
+         int64_t grid_y = (ne00n + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
+         int64_t grid_z = (ne/(ne01n*ne00n) + CUDA_CPY_BLOCK_NM - 1) / CUDA_CPY_BLOCK_NM;
+         GGML_ASSERT(grid_x < UINT_MAX);
+-        GGML_ASSERT(grid_y < USHRT_MAX);
+         GGML_ASSERT(grid_z < USHRT_MAX);
+-        dim3 dimGrid(grid_x, grid_y, grid_z);
++        // grid_y is grid-strided inside the kernel, so cap it to the hardware limit
++        if (grid_y > USHRT_MAX) grid_y = USHRT_MAX;
++        dim3 dimGrid((unsigned) grid_x, (unsigned) grid_y, (unsigned) grid_z);
+         dim3 dimBlock(CUDA_CPY_TILE_DIM_2D, CUDA_CPY_BLOCK_ROWS, 1);
+         cpy_scalar_transpose<dst_t><<<dimGrid, dimBlock, 0, stream>>>
+             (cx, cdst, ne, ne00n, ne01n, ne02n, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
