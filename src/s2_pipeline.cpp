@@ -863,17 +863,17 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         return false;
     }
 
-    // Offline decode has the full code sequence up front. A single full-batch
-    // decode avoids re-decoding history, but on 8 GB GPUs the largest upsample
-    // stages materialize ~805 MB F32 tensors per stage, pushing peak VRAM to
-    // ~96% and spilling to PCIe (element-wise ops run ~24x slower). Chunking to
-    // ~128 frames keeps each window's tensors small enough to stay in VRAM; the
-    // ~160 frames of re-decoded causal-conv history per window is a much smaller
-    // cost than the spill it avoids (measured decode: 25s -> 13s at 1024 frames).
+    // Offline decode has the full code sequence up front, so a single full-batch
+    // pass is optimal. The windowed decoder re-decodes the causal-conv history
+    // for every chunk: at stride 128 a 1024-frame sequence decodes 7 windows
+    // covering 2880 frames (2.8x redundancy), which dominates the VRAM-spill
+    // relief that smaller chunks buy (measured: 53s single-pass vs 220s at
+    // stride 128). Keep the 1024 cap only to bound peak memory for very long
+    // inputs; use stream_decode_stride_frames to force chunking if needed.
     const int32_t offline_decode_stride_frames =
         params.stream_decode_stride_frames > 0
             ? params.stream_decode_stride_frames
-            : std::min(res.n_frames, 128);
+            : std::min(res.n_frames, 1024);
     double decode_ms = 0.0;
     int32_t decode_batches = 0;
     const auto decode_t0 = std::chrono::steady_clock::now();
