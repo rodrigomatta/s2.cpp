@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string>
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <unordered_set>
 #include <thread>
@@ -1055,7 +1056,36 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
         last_token_view(ctx0, slow_cont, n_tokens),
         ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, dim, 1));
 
-    ggml_tensor * logits = mul_mat_checked(ctx0, weights_.embeddings, hidden_last, "mul_mat:logits");
+    // Only materialize the sampling window: the semantic range plus (optionally)
+    // the end-of-sequence token. This shrinks the logits matmul from
+    // vocab_size x dim down to (sem_count + 1) x dim (~38x for the 155k vocab).
+    const int32_t sem_begin = hparams_.semantic_begin_id;
+    const int32_t sem_end   = hparams_.semantic_end_id;
+    const int32_t sem_count = (sem_end >= sem_begin) ? (sem_end - sem_begin + 1) : 0;
+
+    std::vector<int32_t> window_ids;
+    window_ids.reserve(static_cast<size_t>(sem_count) + 1);
+    const bool include_im_end = (im_end_id_ >= 0 && im_end_id_ < hparams_.vocab_size &&
+                                 (im_end_id_ < sem_begin || im_end_id_ > sem_end));
+    if (include_im_end) {
+        window_ids.push_back(im_end_id_);
+    }
+    for (int32_t s = sem_begin; s <= sem_end; ++s) {
+        window_ids.push_back(s);
+    }
+    const int32_t n_window = static_cast<int32_t>(window_ids.size());
+    if (n_window <= 0) {
+        std::fprintf(stderr, "[eval_cached] empty sampling window\n");
+        ggml_free(ctx0);
+        return false;
+    }
+
+    ggml_tensor * window_ids_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_window);
+    ggml_tensor * logits_emb   = ggml_get_rows(ctx0, weights_.embeddings, window_ids_t);
+    if (logits_emb->type != GGML_TYPE_F32) {
+        logits_emb = ggml_cast(ctx0, logits_emb, GGML_TYPE_F32);
+    }
+    ggml_tensor * logits = mul_mat_checked(ctx0, logits_emb, hidden_last, "mul_mat:logits_window");
     ggml_build_forward_expand(gf, logits);
 
     ggml_backend_cpu_set_n_threads(backend_cpu_, resolve_n_threads(n_threads));
@@ -1071,6 +1101,7 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
     ggml_backend_tensor_set(semantic_ids,  semantic_vals.data(), 0, n_tokens * sizeof(int32_t));
     ggml_backend_tensor_set(positions,     pos_vals.data(),       0, n_tokens * sizeof(int32_t));
     ggml_backend_tensor_set(semantic_mask, semantic_mask_vals.data(), 0, n_tokens * sizeof(float));
+    ggml_backend_tensor_set(window_ids_t,  window_ids.data(),     0, n_window * sizeof(int32_t));
     if (token_scale) {
         ggml_backend_tensor_set(token_scale, token_scale_vals.data(), 0, n_tokens * sizeof(float));
     }
@@ -1086,9 +1117,13 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
     }
 
     result.hidden.resize(dim);
-    result.logits.resize(hparams_.vocab_size);
+    result.logits.assign(hparams_.vocab_size, -std::numeric_limits<float>::infinity());
     ggml_backend_tensor_get(hidden_last, result.hidden.data(), 0, dim * sizeof(float));
-    ggml_backend_tensor_get(logits,      result.logits.data(), 0, hparams_.vocab_size * sizeof(float));
+    std::vector<float> reduced_logits(static_cast<size_t>(n_window));
+    ggml_backend_tensor_get(logits, reduced_logits.data(), 0, n_window * sizeof(float));
+    for (int32_t k = 0; k < n_window; ++k) {
+        result.logits[window_ids[k]] = reduced_logits[k];
+    }
 
     ggml_backend_sched_reset(sched_);
     ggml_free(ctx0);

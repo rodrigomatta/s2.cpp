@@ -130,10 +130,16 @@ public:
 
     const ModelHParams & hparams() const { return hparams_; }
 
+    // The end-of-sequence token id (from the tokenizer config). Needed so the
+    // logits head only materializes the sampling window (semantic range + im_end)
+    // instead of the full vocab. Set once before generating.
+    void set_im_end_id(int32_t id) { im_end_id_ = id; }
+
     ModelWeights   weights_;
 
 private:
     ModelHParams   hparams_;
+    int32_t        im_end_id_ = -1;
     ggml_backend_t backend_cpu_  = nullptr;
     ggml_backend_t backend_gpu_  = nullptr;
     ggml_backend_sched_t sched_       = nullptr;

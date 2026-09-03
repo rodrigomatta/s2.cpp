@@ -16,6 +16,7 @@ GenerateResult generate(
 ) {
     const auto generate_t0 = std::chrono::steady_clock::now();
     GenerateResult out;
+    model.set_im_end_id(config.im_end_id);
     out.num_codebooks = model.hparams().num_codebooks;
     if (out.num_codebooks <= 0) out.num_codebooks = 1;
 
