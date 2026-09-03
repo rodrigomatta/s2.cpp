@@ -8,7 +8,6 @@
 #include <cstring>
 #include <string>
 #include <algorithm>
-#include <limits>
 #include <stdexcept>
 #include <unordered_set>
 #include <thread>
@@ -1117,13 +1116,10 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
     }
 
     result.hidden.resize(dim);
-    result.logits.assign(hparams_.vocab_size, -std::numeric_limits<float>::infinity());
+    result.window_ids = window_ids;
+    result.logits.resize(static_cast<size_t>(n_window));
     ggml_backend_tensor_get(hidden_last, result.hidden.data(), 0, dim * sizeof(float));
-    std::vector<float> reduced_logits(static_cast<size_t>(n_window));
-    ggml_backend_tensor_get(logits, reduced_logits.data(), 0, n_window * sizeof(float));
-    for (int32_t k = 0; k < n_window; ++k) {
-        result.logits[window_ids[k]] = reduced_logits[k];
-    }
+    ggml_backend_tensor_get(logits, result.logits.data(), 0, n_window * sizeof(float));
 
     ggml_backend_sched_reset(sched_);
     ggml_free(ctx0);

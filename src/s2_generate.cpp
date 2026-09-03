@@ -20,20 +20,11 @@ GenerateResult generate(
     out.num_codebooks = model.hparams().num_codebooks;
     if (out.num_codebooks <= 0) out.num_codebooks = 1;
 
-    const int32_t vocab_size   = model.hparams().vocab_size;
     const int32_t sem_begin    = model.hparams().semantic_begin_id;
     const int32_t sem_end      = model.hparams().semantic_end_id;
     const int32_t codebook_size = model.hparams().codebook_size;
     const int32_t im_end_id    = config.im_end_id;
     const int32_t num_cb       = out.num_codebooks;
-
-    std::vector<float> sem_mask(vocab_size, -std::numeric_limits<float>::infinity());
-    for (int32_t i = sem_begin; i <= sem_end && i < vocab_size; ++i) {
-        sem_mask[i] = 0.0f;
-    }
-    if (im_end_id >= 0 && im_end_id < vocab_size) {
-        sem_mask[im_end_id] = 0.0f;
-    }
 
     const int32_t rows = prompt.rows;
     const int32_t cols = prompt.cols;
@@ -55,34 +46,37 @@ GenerateResult generate(
     }
     const auto prefill_t1 = std::chrono::steady_clock::now();
 
-    auto apply_mask_and_sample = [&](const std::vector<float> & logits,
-                                     bool block_im_end) -> int32_t {
-        std::vector<float> biased(vocab_size);
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            biased[i] = logits[i] + sem_mask[i];
+    SamplerParams sparams;
+    sparams.temperature     = params.temperature;
+    sparams.top_p           = params.top_p;
+    sparams.top_k           = params.top_k;
+
+    // Sample from the pre-masked window. state.logits[i] scores
+    // state.window_ids[i]; the window is exactly the semantic range + im_end.
+    auto sample_window = [&](const StepResult & s, bool block_im_end,
+                             const SamplerParams & sp) -> int32_t {
+        if (block_im_end) {
+            std::vector<float> biased = s.logits;
+            for (size_t i = 0; i < s.window_ids.size(); ++i) {
+                if (s.window_ids[i] == im_end_id) {
+                    biased[i] = -std::numeric_limits<float>::infinity();
+                    break;
+                }
+            }
+            const int32_t idx = sample_token(biased.data(), (int32_t)biased.size(), sp);
+            return s.window_ids[idx];
         }
-        if (block_im_end && im_end_id >= 0 && im_end_id < vocab_size) {
-            biased[im_end_id] = -std::numeric_limits<float>::infinity();
-        }
-        SamplerParams sparams;
-        sparams.temperature     = params.temperature;
-        sparams.top_p           = params.top_p;
-        sparams.top_k           = params.top_k;
-        return sample_token(biased.data(), vocab_size, sparams);
+        const int32_t idx = sample_token(s.logits.data(), (int32_t)s.logits.size(), sp);
+        return s.window_ids[idx];
     };
 
     bool block_end = (params.min_tokens_before_end > 0);
-    int32_t main_token = apply_mask_and_sample(state.logits, block_end);
+    int32_t main_token = sample_window(state, block_end, sparams);
 
     out.codes.resize(static_cast<size_t>(num_cb) * params.max_new_tokens, 0);
     out.n_frames = 0;
 
     std::vector<float> fast_logits;
-
-    SamplerParams sparams;
-    sparams.temperature     = params.temperature;
-    sparams.top_p           = params.top_p;
-    sparams.top_k           = params.top_k;
 
     std::vector<int32_t> ras_window;
     const int32_t ras_window_size = 10;
@@ -94,6 +88,8 @@ GenerateResult generate(
     }
 
     int32_t step = 0;
+    double slow_step_ms = 0.0;
+    double fast_decode_ms = 0.0;
     const auto loop_t0 = std::chrono::steady_clock::now();
     while (main_token != im_end_id && step < params.max_new_tokens) {
 
@@ -102,18 +98,12 @@ GenerateResult generate(
             main_token >= sem_begin && main_token <= sem_end)
         {
 
-            std::vector<float> biased(vocab_size);
-            for (int32_t i = 0; i < vocab_size; ++i) {
-                biased[i] = state.logits[i] + sem_mask[i];
-            }
-            if (step < params.min_tokens_before_end && im_end_id >= 0 && im_end_id < vocab_size) {
-                biased[im_end_id] = -std::numeric_limits<float>::infinity();
-            }
             SamplerParams ras_sparams;
             ras_sparams.temperature = ras_high_temp;
             ras_sparams.top_p       = ras_high_top_p;
             ras_sparams.top_k       = params.top_k;
-            main_token = sample_token(biased.data(), vocab_size, ras_sparams);
+            const bool ras_block = (step < params.min_tokens_before_end);
+            main_token = sample_window(state, ras_block, ras_sparams);
         }
 
         ras_window.push_back(main_token);
@@ -131,6 +121,7 @@ GenerateResult generate(
 
         for (int32_t cb_idx = 1; cb_idx < num_cb; ++cb_idx) {
 
+            const auto fd_t0 = std::chrono::steady_clock::now();
             if (!model.fast_decode(state.hidden, codebooks_cb, params.n_threads, fast_logits)) {
                 std::cerr << "[Generate] fast_decode failed at cb " << cb_idx << std::endl;
 
@@ -141,6 +132,8 @@ GenerateResult generate(
             }
             int32_t cb_token = sample_token(fast_logits.data(), (int32_t)fast_logits.size(), sparams);
             codebooks_cb.push_back(cb_token);
+            const auto fd_t1 = std::chrono::steady_clock::now();
+            fast_decode_ms += std::chrono::duration<double, std::milli>(fd_t1 - fd_t0).count();
         }
 
         for (int32_t cb = 0; cb < num_cb; ++cb) {
@@ -169,10 +162,13 @@ GenerateResult generate(
             step_input[cb + 1] = codebooks_cb[cb];
         }
 
+        const auto ss_t0 = std::chrono::steady_clock::now();
         if (!model.step(step_input, params.n_threads, state)) {
             std::cerr << "[Generate] step() failed at step " << step << std::endl;
             break;
         }
+        const auto ss_t1 = std::chrono::steady_clock::now();
+        slow_step_ms += std::chrono::duration<double, std::milli>(ss_t1 - ss_t0).count();
 
         step++;
         if (params.verbose && log_enabled(LogLevel::Info) && step % 50 == 0) {
@@ -180,7 +176,7 @@ GenerateResult generate(
         }
 
         bool block_next_end = (step < params.min_tokens_before_end);
-        main_token = apply_mask_and_sample(state.logits, block_next_end);
+        main_token = sample_window(state, block_next_end, sparams);
     }
 
     if (params.verbose && log_enabled(LogLevel::Info)) {
@@ -194,7 +190,11 @@ GenerateResult generate(
         std::cout << "[Generate] Done: " << out.n_frames << " frames generated." << std::endl;
         std::cout << "[Metrics] Generate: prefill=" << prefill_ms
                   << " ms, loop=" << loop_ms
-                  << " ms, total=" << total_ms
+                  << " ms, slow_step=" << slow_step_ms
+                  << " ms (" << (out.n_frames > 0 ? slow_step_ms / out.n_frames : 0.0) << " ms/frame)"
+                  << ", fast_decode=" << fast_decode_ms
+                  << " ms (" << (out.n_frames > 0 ? fast_decode_ms / out.n_frames : 0.0) << " ms/frame)"
+                  << ", total=" << total_ms
                   << " ms, avg=" << ms_per_frame
                   << " ms/frame" << std::endl;
     }

@@ -86,6 +86,11 @@ struct ModelWeights {
 
 struct StepResult {
     std::vector<float> hidden;
+    // The sampling window is the semantic range plus the end-of-sequence token
+    // (im_end). logits holds one score per window entry; window_ids maps each
+    // entry back to its full-vocab id. This keeps the logits head, the mask
+    // application and the sampler all O(window) instead of O(vocab_size).
+    std::vector<int32_t> window_ids;
     std::vector<float> logits;
 };
 
