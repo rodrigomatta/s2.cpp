@@ -87,8 +87,8 @@ void print_uso() {
     safe_print("  --trim-silence              Trim trailing silence in output WAV\n");
     safe_print("  --no-normalize              Keep original output peak level\n");
     safe_print("  --normalize                 Peak-normalize output WAV to 0.95\n");
-    safe_print("  --codec-auto                Benchmark codec backends and keep the fastest (default)\n");
-    safe_print("  --codec-follow-backend      Force codec to follow the selected GPU backend\n");
+    safe_print("  --codec-auto                Benchmark codec backends and keep the fastest\n");
+    safe_print("  --codec-follow-backend      Force codec to follow the selected GPU backend (default)\n");
     safe_print("  --codec-cpu                 Force codec on CPU even when model uses GPU\n");
     safe_print("  --stream-file               Write output WAV through the streaming path\n");
     safe_print("  --stream-decode-stride <n>  Decode cadence in frames (0 = auto: server 4, file/offline 16)\n");
