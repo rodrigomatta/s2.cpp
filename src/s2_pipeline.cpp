@@ -863,8 +863,15 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         return false;
     }
 
+    // Offline decode already has the full code sequence, so decode in as few
+    // passes as possible. The old default of 16 (a streaming latency knob) made
+    // each window re-decode ~160 frames of history -> ~15x redundant work. Using
+    // the full frame count makes it a single pass (capped to bound peak memory
+    // for very long inputs).
     const int32_t offline_decode_stride_frames =
-        params.stream_decode_stride_frames > 0 ? params.stream_decode_stride_frames : 16;
+        params.stream_decode_stride_frames > 0
+            ? params.stream_decode_stride_frames
+            : std::min(res.n_frames, 1024);
     double decode_ms = 0.0;
     int32_t decode_batches = 0;
     const auto decode_t0 = std::chrono::steady_clock::now();
