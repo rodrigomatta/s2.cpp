@@ -153,6 +153,10 @@ int main(int argc, char** argv) {
     bool list_voices = false;
     s2::ServerParams serverParams;
 
+    // Install the level-aware ggml log forwarding now (and set the default level),
+    // so ggml DEBUG noise is suppressed even when --log-level is not passed.
+    s2::set_log_level(s2::LogLevel::Info);
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if      (arg == "-m"  || arg == "--model")        { if (i+1 < argc) params.model_path        = argv[++i]; }
