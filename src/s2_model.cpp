@@ -1183,7 +1183,10 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
     const int32_t q_size    = n_head * head_dim;
     const int32_t kv_size   = n_head_kv * head_dim;
     const float attn_scale  = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    const int32_t n_tokens  = static_cast<int32_t>(prefix_tokens.size()) + 1;
+    // Fixed sequence length (num_codebooks) so the graph is shape-stable for CUDA
+    // graph capture. The prefix is right-padded with masked-out dummy tokens and the
+    // output token is gathered by a runtime index (see out_idx below).
+    const int32_t n_tokens  = hparams_.num_codebooks;
 
     if (fast_ctx_size_ == 0) {
         fast_ctx_size_ = 8u * 1024u * 1024u;
@@ -1205,17 +1208,18 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
     }
 
     ggml_tensor * x = projected;
-    ggml_tensor * prefix_ids = nullptr;
-    if (!prefix_tokens.empty()) {
-        prefix_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)prefix_tokens.size());
-        ggml_tensor * prefix_emb = ggml_get_rows(ctx0, weights_.fast_embeddings, prefix_ids);
-        if (prefix_emb->type != GGML_TYPE_F32) {
-            prefix_emb = ggml_cast(ctx0, prefix_emb, GGML_TYPE_F32);
-        }
-        x = ggml_concat(ctx0, x, prefix_emb, 1);
+    // Prefix is always length (n_tokens - 1): real prefix tokens first, zero-padded dummy
+    // tokens after. Dummies sit beyond the causal diagonal / are discarded by the runtime
+    // output index, so only the real prefix affects the result.
+    ggml_tensor * prefix_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens - 1);
+    ggml_tensor * prefix_emb = ggml_get_rows(ctx0, weights_.fast_embeddings, prefix_ids);
+    if (prefix_emb->type != GGML_TYPE_F32) {
+        prefix_emb = ggml_cast(ctx0, prefix_emb, GGML_TYPE_F32);
     }
+    x = ggml_concat(ctx0, x, prefix_emb, 1);
 
     ggml_tensor * positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * out_idx   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
     std::vector<int32_t> pos_vals(n_tokens);
     for (int32_t i = 0; i < n_tokens; ++i) pos_vals[i] = i;
 
@@ -1275,9 +1279,9 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
 
     ggml_tensor * fast_out  = rms_norm_weighted(ctx0, x, weights_.fast_norm, hparams_.fast_rms_norm_eps);
     ggml_tensor * fast_cont = ggml_cont(ctx0, fast_out);
-    ggml_tensor * fast_last = ggml_cpy(ctx0,
-        last_token_view(ctx0, fast_cont, n_tokens),
-        ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, fast_dim, 1));
+    // Gather the last *real* token's hidden (out_idx == prefix_tokens.size()) instead of the
+    // fixed last column, so the output position is a graph input rather than a shape.
+    ggml_tensor * fast_last = ggml_get_rows(ctx0, fast_cont, out_idx);
     ggml_tensor * logits = mul_mat_checked(ctx0, weights_.fast_output, fast_last, "mul_mat:fast_logits");
     ggml_build_forward_expand(gf, logits);
 
@@ -1293,9 +1297,15 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
 
     ggml_backend_tensor_set(hidden0,   hidden_in.data(),    0, hidden_in.size() * sizeof(float));
     ggml_backend_tensor_set(positions, pos_vals.data(),     0, pos_vals.size() * sizeof(int32_t));
-    if (prefix_ids) {
-        ggml_backend_tensor_set(prefix_ids, prefix_tokens.data(), 0,
-                                prefix_tokens.size() * sizeof(int32_t));
+    {
+        std::vector<int32_t> prefix_id_vals(static_cast<size_t>(n_tokens - 1), 0);
+        for (size_t i = 0; i < prefix_tokens.size(); ++i) {
+            prefix_id_vals[i] = prefix_tokens[i];
+        }
+        ggml_backend_tensor_set(prefix_ids, prefix_id_vals.data(), 0,
+                                prefix_id_vals.size() * sizeof(int32_t));
+        const int32_t out_pos = static_cast<int32_t>(prefix_tokens.size());
+        ggml_backend_tensor_set(out_idx, &out_pos, 0, sizeof(int32_t));
     }
 
     if (ggml_backend_sched_graph_compute(fast_sched_, gf) != GGML_STATUS_SUCCESS) {
