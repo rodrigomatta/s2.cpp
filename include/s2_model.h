@@ -161,6 +161,34 @@ private:
     size_t         fast_ctx_size_ = 0;
     std::vector<uint8_t> fast_ctx_buf_;
 
+    // Stage 2A: cached decode graphs. The slow decode (n_tokens == 1) and fast
+    // decode (fixed num_codebooks) graphs are shape-stable, so they are built once
+    // and reused across frames — only the input tensor VALUES are re-uploaded.
+    // Cached tensors reference memory_k_/memory_v_ (KV cache) and the scheduler's
+    // compute buffers, so this state is invalidated whenever those are rebuilt.
+    ggml_context * slow_ctx_   = nullptr;
+    ggml_cgraph  * slow_gf_    = nullptr;
+    ggml_tensor  * slow_semantic_ids_  = nullptr;
+    ggml_tensor  * slow_positions_     = nullptr;
+    ggml_tensor  * slow_semantic_mask_ = nullptr;
+    ggml_tensor  * slow_n_past_idx_    = nullptr;
+    ggml_tensor  * slow_token_scale_   = nullptr;
+    ggml_tensor  * slow_attn_mask_     = nullptr;
+    ggml_tensor  * slow_hidden_last_   = nullptr;
+    ggml_tensor  * slow_logits_        = nullptr;
+    ggml_tensor  * slow_window_ids_t_  = nullptr;
+    std::vector<ggml_tensor *> slow_cb_id_tensors_;
+
+    ggml_context * fast_ctx_   = nullptr;
+    ggml_cgraph  * fast_gf_    = nullptr;
+    ggml_tensor  * fast_hidden0_     = nullptr;
+    ggml_tensor  * fast_prefix_ids_  = nullptr;
+    ggml_tensor  * fast_positions_   = nullptr;
+    ggml_tensor  * fast_out_idx_     = nullptr;
+    ggml_tensor  * fast_logits_      = nullptr;
+
+    void invalidate_cached_graphs();
+
     std::unordered_set<ggml_tensor *> weight_tensor_set_;
 
 };
