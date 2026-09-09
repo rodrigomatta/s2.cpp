@@ -9,8 +9,10 @@ obj/
 *.a
 *.so
 *.d
+*.exe
 *.pyc
 compile_commands.json
+rebuild_cuda.bat
 __pycache__/
 .cache/
 .claude/
