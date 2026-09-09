@@ -1,0 +1,55 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3284,6 +3284,42 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+     return cgraph->nodes[0];
+ }
+ 
++static bool ggml_cuda_graph_node_props_equal(const ggml_cuda_graph::node_properties & a,
++                                             const ggml_cuda_graph::node_properties & b) {
++    const ggml_tensor & ta = a.node;
++    const ggml_tensor & tb = b.node;
++
++    // Compare field-by-field. The tensor's name[] and compiler-inserted padding bytes are
++    // deliberately excluded: name is a label, and padding is uninitialized so a raw memcmp
++    // would report spurious changes (forcing a re-capture every call).
++    if (ta.type      != tb.type      ||
++        ta.buffer    != tb.buffer    ||
++        ta.op        != tb.op        ||
++        ta.flags     != tb.flags     ||
++        ta.view_src  != tb.view_src  ||
++        ta.view_offs != tb.view_offs ||
++        ta.data      != tb.data      ||
++        ta.extra     != tb.extra) {
++        return false;
++    }
++    if (memcmp(ta.ne, tb.ne, sizeof(ta.ne)) != 0 ||
++        memcmp(ta.nb, tb.nb, sizeof(ta.nb)) != 0 ||
++        memcmp(ta.op_params, tb.op_params, sizeof(ta.op_params)) != 0) {
++        return false;
++    }
++    for (int j = 0; j < GGML_MAX_SRC; ++j) {
++        if (ta.src[j] != tb.src[j] ||
++            a.node_src_data_ptrs[j] != b.node_src_data_ptrs[j]) {
++            return false;
++        }
++        if (memcmp(a.node_src_ne[j], b.node_src_ne[j], sizeof(a.node_src_ne[j])) != 0 ||
++            memcmp(a.node_src_nb[j], b.node_src_nb[j], sizeof(a.node_src_nb[j])) != 0) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+     bool res = false;
+ 
+@@ -3317,7 +3353,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
+             }
+         }
+ 
+-        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
++        if (res || !ggml_cuda_graph_node_props_equal(graph->node_props[i], prop)) {
+             graph->node_props[i] = prop;
+             res = true;
+         }
