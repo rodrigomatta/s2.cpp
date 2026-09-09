@@ -35,7 +35,12 @@ struct PipelineParams {
     int32_t gpu_device = -1;
     BackendType backend_type = BackendType::CPU;
     int32_t n_gpu_layers = -1;
-    bool codec_auto_backend = true;
+    // The "auto" backend selection benchmarks the codec on both CPU and GPU
+    // before picking a winner. On a GPU system the GPU codec is effectively
+    // always faster, so the benchmark only wastes a full CPU decode (which can
+    // take ~10s even for a handful of frames). Default to following the selected
+    // backend instead; --codec-auto still opts back into the benchmark.
+    bool codec_auto_backend = false;
     bool codec_follow_backend = true;
     int32_t stream_decode_stride_frames = 0;
     int32_t stream_holdback_frames = -1;
