@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <fstream>
 #include <limits>
+#include <string>
+#include "s2_unicode_tables.h"
 
 using json = nlohmann::json;
 
@@ -118,25 +120,101 @@ static std::vector<std::string> split_on_specials(
     return segments;
 }
 
-static std::vector<std::string> pre_tokenize(const std::string & text) {
-    std::vector<std::string> words;
-    std::string current;
-    auto chars = utf8_chars(text);
-    for (const auto & ch : chars) {
-        if (ch.size() == 1 && (ch[0] == ' ' || ch[0] == '\t' || ch[0] == '\n' || ch[0] == '\r')) {
-            if (!current.empty()) {
-                words.push_back(current);
-                current.clear();
-            }
-            current = ch;
-        } else {
-            current += ch;
+// Pre-tokenizer: the regex from tokenizer.json ("Split" pre_tokenizer), matched by hand
+// (no regex engine with \p{L}/\p{N} support is available here; the Unicode tables are generated
+// by scripts/gen_unicode.py):
+// (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+template <size_t N>
+static bool in_ranges(const uint32_t (&tbl)[N][2], uint32_t cp) {
+    size_t lo = 0, hi = N;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (cp < tbl[mid][0]) hi = mid;
+        else if (cp > tbl[mid][1]) lo = mid + 1;
+        else return true;
+    }
+    return false;
+}
+static bool is_L(uint32_t c) { return in_ranges(kUniLetter, c); }
+static bool is_N(uint32_t c) { return in_ranges(kUniNumber, c); }
+static bool is_S(uint32_t c) { return in_ranges(kUniSpace, c); }
+static bool is_NL(uint32_t c) { return c == '\r' || c == '\n'; }
+
+std::vector<std::string> pre_tokenize(const std::string & text) {
+    // decode to code points, remembering byte offsets
+    std::vector<uint32_t> cps;
+    std::vector<size_t> off;
+    for (size_t i = 0; i < text.size();) {
+        unsigned char b = (unsigned char) text[i];
+        uint32_t cp; size_t len;
+        if (b < 0x80) { cp = b; len = 1; }
+        else if ((b >> 5) == 6 && i + 1 < text.size()) { cp = ((b & 0x1F) << 6) | (text[i+1] & 0x3F); len = 2; }
+        else if ((b >> 4) == 14 && i + 2 < text.size()) { cp = ((b & 0x0F) << 12) | ((text[i+1] & 0x3F) << 6) | (text[i+2] & 0x3F); len = 3; }
+        else if ((b >> 3) == 30 && i + 3 < text.size()) { cp = ((b & 0x07) << 18) | ((text[i+1] & 0x3F) << 12) | ((text[i+2] & 0x3F) << 6) | (text[i+3] & 0x3F); len = 4; }
+        else { cp = 0xFFFD; len = 1; }
+        cps.push_back(cp); off.push_back(i);
+        i += len;
+    }
+    off.push_back(text.size());
+    const size_t n = cps.size();
+    std::vector<std::string> out;
+    size_t i = 0;
+    // (?i:...) folds case the Unicode way. Of the letters in the contractions only U+017F (long s) folds to one of
+    // them ('s), so a long s after the apostrophe is a contraction like "'s".
+    auto lower = [](uint32_t c) { return (c >= 'A' && c <= 'Z') ? c + 32 : (c == 0x17F ? (uint32_t) 's' : c); };
+    while (i < n) {
+        size_t end = 0;
+        const uint32_t c = cps[i];
+        // 1. contractions
+        if (c == '\'' && i + 1 < n) {
+            uint32_t a = lower(cps[i+1]);
+            uint32_t b2 = (i + 2 < n) ? lower(cps[i+2]) : 0;
+            if ((a == 's' || a == 't' || a == 'm' || a == 'd')) end = i + 2;
+            else if ((a == 'r' && b2 == 'e') || (a == 'v' && b2 == 'e') || (a == 'l' && b2 == 'l')) end = i + 3;
         }
+        // 2. [^\r\n\p{L}\p{N}]?\p{L}+
+        if (!end) {
+            size_t j = i;
+            if (!is_NL(c) && !is_L(c) && !is_N(c)) j = i + 1;
+            if (j < n && is_L(cps[j])) {
+                while (j < n && is_L(cps[j])) ++j;
+                end = j;
+            }
+        }
+        // 3. \p{N}
+        if (!end && is_N(c)) end = i + 1;
+        // 4.  ?[^\s\p{L}\p{N}]+[\r\n]*
+        if (!end) {
+            size_t j = i;
+            if (c == ' ') j = i + 1;
+            size_t k = j;
+            while (k < n && !is_S(cps[k]) && !is_L(cps[k]) && !is_N(cps[k])) ++k;
+            if (k > j) {
+                while (k < n && is_NL(cps[k])) ++k;
+                end = k;
+            }
+        }
+        // 5-7. whitespace runs
+        if (!end && is_S(c)) {
+            size_t w = i;
+            while (w < n && is_S(cps[w])) ++w;
+            size_t last_nl = std::string::npos;
+            for (size_t k = i; k < w; ++k) if (is_NL(cps[k])) last_nl = k;
+            if (last_nl != std::string::npos) {
+                end = last_nl + 1;                      // \s*[\r\n]+
+            } else if (w == n) {
+                end = w;                                // \s+(?!\S) at end of text
+            } else if (w - i >= 2) {
+                end = w - 1;                            // \s+(?!\S) leaves one for the next word
+            } else {
+                end = w;                                // \s+
+            }
+        }
+        if (!end) end = i + 1;
+        out.push_back(text.substr(off[i], off[end] - off[i]));
+        i = end;
     }
-    if (!current.empty()) {
-        words.push_back(current);
-    }
-    return words;
+    return out;
 }
 
 std::vector<int32_t> Tokenizer::bpe_encode_word(const std::string & word) const {

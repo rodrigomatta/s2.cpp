@@ -122,6 +122,14 @@ Adjust the library path for macOS / Windows or custom build directories.
 ## Verification
 
 There is no first-party automated test suite in the main `s2.cpp` target today.
+The one unit test covers the tokenizer's pre-tokenizer; run it when touching
+`src/s2_tokenizer.cpp` or `src/s2_unicode_tables.h`:
+
+```bash
+cmake -S . -B build -DS2_BUILD_TESTS=ON
+cmake --build build --target test_pretokenize
+ctest --test-dir build --output-on-failure
+```
 
 For most changes, verify with:
 

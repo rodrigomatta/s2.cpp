@@ -14,6 +14,7 @@ option(S2_CUDA    "Build with CUDA backend"    OFF)
 option(S2_METAL   "Build with Metal backend"   OFF)
 option(S2_BUILD_SHARED_LIBRARIES "Build S2 shared and static library targets" OFF)
 option(S2_AUTO_APPLY_LOCAL_PATCHES "Automatically apply local patches from patches/*.patch during build" ON)
+option(S2_BUILD_TESTS "Build the unit tests (run them with ctest)" OFF)
 
 if(S2_METAL AND NOT APPLE)
     message(FATAL_ERROR "S2_METAL is only supported on Apple platforms.")
@@ -156,6 +157,16 @@ if(S2_BUILD_SHARED_LIBRARIES)
         ARCHIVE DESTINATION lib
         LIBRARY DESTINATION lib
         RUNTIME DESTINATION bin)
+endif()
+
+if(S2_BUILD_TESTS)
+    enable_testing()
+    add_executable(test_pretokenize tests/test_pretokenize.cpp src/s2_tokenizer.cpp)
+    target_include_directories(test_pretokenize PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+    )
+    add_test(NAME pretokenize COMMAND test_pretokenize)
 endif()
 
 install(TARGETS s2 RUNTIME DESTINATION bin)

@@ -19,6 +19,10 @@ struct TokenizerConfig {
     int32_t vocab_size        = 155776;
 };
 
+// Splits text into the pieces the "Split" pre-tokenizer of tokenizer.json produces (before the byte-level
+// mapping and BPE): (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+std::vector<std::string> pre_tokenize(const std::string & text);
+
 class Tokenizer {
 public:
     Tokenizer() = default;
