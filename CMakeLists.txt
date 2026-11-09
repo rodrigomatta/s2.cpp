@@ -58,6 +58,9 @@ else()
 endif()
 if(S2_CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
+    # ggml leaves CUDA graphs off unless the parent project asks; the Fast-AR graphs are replayed
+    # with identical shapes every codebook step, which is exactly what they are for.
+    set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)
 else()
     set(GGML_CUDA OFF CACHE BOOL "" FORCE)
 endif()
