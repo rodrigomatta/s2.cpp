@@ -1575,6 +1575,10 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
     if (extends) {
         ok = run_fast_graph(fast_graph_[0], nullptr, prefix_tokens[n - 1], static_cast<int32_t>(n), n_threads, logits_out);
     } else {
+        // A new frame (or a prefix that does not continue the last one). The graphs mask out the rows that
+        // lie ahead, but a masked row is still read: if an earlier decode left non-finite K/V values there,
+        // 0 * NaN poisons the attention output for every later frame. Start from a zeroed cache.
+        ggml_backend_buffer_clear(fast_kv_buf_, 0);
         ok = run_fast_graph(fast_graph_[1], hidden_in.data(), prefix_tokens[0], 0, n_threads, logits_out);
         for (size_t i = 1; ok && i < n; ++i) {
             ok = run_fast_graph(fast_graph_[0], nullptr, prefix_tokens[i], static_cast<int32_t>(i) + 1, n_threads, logits_out);
