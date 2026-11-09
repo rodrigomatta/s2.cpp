@@ -190,6 +190,8 @@ SlowARModel::~SlowARModel() {
     if (sched_)          ggml_backend_sched_free(sched_);
 
     if (kv_buf_) ggml_backend_buffer_free(kv_buf_);
+    if (weights_.buf_extra) ggml_backend_buffer_free(weights_.buf_extra);
+    if (weights_.ctx_extra) ggml_free(weights_.ctx_extra);
     free_backend_buffers(weights_.model_bufs_gpu);
     free_backend_buffers(weights_.model_bufs_cpu);
 
@@ -489,6 +491,9 @@ bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_
             return backend_gpu_;
         }
 
+        if (name == "norm.weight" && backend_gpu_ && n_gpu_layers_ >= hparams_.block_count) {
+            return backend_gpu_;
+        }
         if (name == "embeddings.weight" ||
             name == "codebook_embeddings.weight" ||
             name == "fast_embeddings.weight" ||
@@ -579,6 +584,31 @@ bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_
 
     weights_.model_bufs_gpu = std::move(gpu_buffers);
     weights_.model_bufs_cpu = std::move(cpu_buffers);
+
+    // The token embedding table is also the output (logits) projection, and the Fast-AR code embedding
+    // table is read at every codebook step. Both stay on the CPU as weights (see get_weight_backend),
+    // which puts a CPU<->GPU hop inside every step; on CUDA keep a GPU copy of each for the graphs.
+    if (backend_type == BackendType::CUDA && backend_gpu_ && n_gpu_layers_ > 0) {
+        ggml_init_params ep = { 4 * ggml_tensor_overhead() + 1024, nullptr, true };
+        weights_.ctx_extra = ggml_init(ep);
+        weights_.embeddings_out = ggml_new_tensor_2d(weights_.ctx_extra, weights_.embeddings->type,
+                                                     weights_.embeddings->ne[0], weights_.embeddings->ne[1]);
+        ggml_set_name(weights_.embeddings_out, "embeddings_out_gpu");
+        if (weights_.fast_embeddings) {
+            weights_.fast_embeddings_gpu = ggml_new_tensor_2d(weights_.ctx_extra, GGML_TYPE_F16,
+                                                              weights_.fast_embeddings->ne[0], weights_.fast_embeddings->ne[1]);
+            ggml_set_name(weights_.fast_embeddings_gpu, "fast_embeddings_gpu");
+        }
+        weights_.buf_extra = ggml_backend_alloc_ctx_tensors(weights_.ctx_extra, backend_gpu_);
+        if (!weights_.buf_extra) {
+            std::cerr << "[Model] GPU copy of the embedding tables failed to allocate; using the CPU tables." << std::endl;
+            weights_.embeddings_out = nullptr;
+            weights_.fast_embeddings_gpu = nullptr;
+        } else {
+            S2_LOG_INFO_STREAM("[Model] GPU copy of embedding tables: "
+                      << ggml_backend_buffer_get_size(weights_.buf_extra) / 1048576.0 << " MB" << std::endl);
+        }
+    }
 
     {
         ggml_backend_t backends[2];
@@ -682,6 +712,7 @@ bool SlowARModel::read_tensor_data(const std::string & gguf_path, gguf_context *
             return false;
         }
         ggml_backend_tensor_set(t, tmp.data(), 0, tsize);
+        mirror_to_extra(t, tmp.data(), tsize);
     }
     tmp.clear();
     tmp.shrink_to_fit();
@@ -1055,7 +1086,7 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
         last_token_view(ctx0, slow_cont, n_tokens),
         ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, dim, 1));
 
-    ggml_tensor * logits = mul_mat_checked(ctx0, weights_.embeddings, hidden_last, "mul_mat:logits");
+    ggml_tensor * logits = mul_mat_checked(ctx0, weights_.embeddings_out ? weights_.embeddings_out : weights_.embeddings, hidden_last, "mul_mat:logits");
     ggml_build_forward_expand(gf, logits);
 
     ggml_backend_cpu_set_n_threads(backend_cpu_, resolve_n_threads(n_threads));
@@ -1149,7 +1180,7 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
     ggml_tensor * prefix_ids = nullptr;
     if (!prefix_tokens.empty()) {
         prefix_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)prefix_tokens.size());
-        ggml_tensor * prefix_emb = ggml_get_rows(ctx0, weights_.fast_embeddings, prefix_ids);
+        ggml_tensor * prefix_emb = ggml_get_rows(ctx0, weights_.fast_embeddings_gpu ? weights_.fast_embeddings_gpu : weights_.fast_embeddings, prefix_ids);
         if (prefix_emb->type != GGML_TYPE_F32) {
             prefix_emb = ggml_cast(ctx0, prefix_emb, GGML_TYPE_F32);
         }
@@ -1252,6 +1283,28 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
     ggml_backend_sched_reset(fast_sched_);
     ggml_free(ctx0);
     return true;
+}
+
+
+void SlowARModel::mirror_to_extra(ggml_tensor * t, const void * data, size_t size) {
+    if (weights_.embeddings_out && t == weights_.embeddings) {
+        ggml_backend_tensor_set(weights_.embeddings_out, data, 0, size);
+    }
+    if (weights_.fast_embeddings_gpu && t == weights_.fast_embeddings) {
+        const int64_t n = ggml_nelements(t);
+        std::vector<float> f32(n);
+        if (t->type == GGML_TYPE_F32) {
+            std::memcpy(f32.data(), data, n * sizeof(float));
+        } else if (t->type == GGML_TYPE_F16) {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *)data, f32.data(), n);
+        } else {
+            const auto * tr = ggml_get_type_traits(t->type);
+            tr->to_float(data, f32.data(), n);
+        }
+        std::vector<ggml_fp16_t> f16(n);
+        ggml_fp32_to_fp16_row(f32.data(), f16.data(), n);
+        ggml_backend_tensor_set(weights_.fast_embeddings_gpu, f16.data(), 0, n * sizeof(ggml_fp16_t));
+    }
 }
 
 }

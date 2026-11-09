@@ -341,6 +341,7 @@ static bool read_all_tensor_data(
                 return false;
             }
             ggml_backend_tensor_set(t, tmp.data(), 0, tsize);
+            model.mirror_to_extra(t, tmp.data(), tsize);
             continue;
         }
 

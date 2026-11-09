@@ -72,6 +72,10 @@ struct ModelWeights {
     std::vector<ggml_backend_buffer_t> model_bufs_cpu;
     std::vector<ggml_backend_buffer_t> model_bufs_gpu;
 
+    ggml_context * ctx_extra = nullptr;
+    ggml_backend_buffer_t buf_extra = nullptr;
+    ggml_tensor * fast_embeddings_gpu  = nullptr;
+    ggml_tensor * embeddings_out       = nullptr; // GPU copy used only for the logits matmul
     ggml_tensor * embeddings           = nullptr;
     ggml_tensor * codebook_embeddings  = nullptr;
     ggml_tensor * norm                 = nullptr;
@@ -102,6 +106,7 @@ public:
 
     ggml_context * weights_ctx() { return weights_.ctx_w; }
     const std::unordered_set<ggml_tensor *> & weight_tensor_set() const { return weight_tensor_set_; }
+    void mirror_to_extra(ggml_tensor * t, const void * data, size_t size);
 
     bool init_kv_cache(int32_t max_seq_len);
 
