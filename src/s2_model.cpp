@@ -1538,6 +1538,9 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
 }
 
 void SlowARModel::mirror_to_extra(ggml_tensor * t, const void * data, size_t size) {
+    // Whoever writes weights (the pipeline, or the codec through the shared context) also makes whatever
+    // the Fast-AR cache holds for the current frame stale.
+    fast_cached_prefix_.clear();
     if (weights_.embeddings_out && t == weights_.embeddings) {
         ggml_backend_tensor_set(weights_.embeddings_out, data, 0, size);
     }

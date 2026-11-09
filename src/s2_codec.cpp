@@ -64,6 +64,7 @@ struct AudioCodec::Impl {
     ggml_backend_t        backend   = nullptr;
     ggml_context *        ctx_w     = nullptr;
     ggml_backend_buffer_t model_buf = nullptr;
+    SlowARModel *         shared_model = nullptr; // owner of ctx_w when it is shared with the model
     std::string tprefix;
 
     int32_t sample_rate   = 0;
@@ -759,7 +760,7 @@ bool AudioCodec::load_shared(SlowARModel* Model, gguf_context * shared_gguf_ctx,
 
         gguf_free(local_gguf);
     }
-    else { impl_->ctx_w = Model->weights_.ctx_w; }
+    else { impl_->ctx_w = Model->weights_.ctx_w; impl_->shared_model = Model; }
 
     gguf_context * gguf_ctx = shared_gguf_ctx;
 
@@ -945,6 +946,8 @@ bool AudioCodec::read_tensor_data(const std::string & gguf_path, gguf_context * 
             return false;
         }
         ggml_backend_tensor_set(t, tmp.data(), 0, nbytes);
+        // a shared context also holds the model's tensors, and the model keeps GPU copies of two of them
+        if (impl_->shared_model) impl_->shared_model->mirror_to_extra(t, tmp.data(), nbytes);
     }
     std::fclose(f);
     return refresh_host_caches();
