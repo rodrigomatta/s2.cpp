@@ -7,21 +7,29 @@
 # which changes the BPE token ids.
 #
 # usage: python scripts/gen_unicode.py src/s2_unicode_tables.h [path/to/UnicodeData.txt]
-# Without a path, UnicodeData.txt of UNICODE_VERSION is downloaded from unicode.org.
+# Without a path, UnicodeData.txt of UNICODE_VERSION is downloaded from unicode.org. Either way the file
+# must be that version's (checked by its SHA-256), so the tables never carry another version's label.
+import hashlib
 import sys
 import urllib.request
 
 UNICODE_VERSION = "16.0.0"
+# SHA-256 of https://www.unicode.org/Public/16.0.0/ucd/UnicodeData.txt (LF line endings)
+UNICODE_DATA_SHA256 = "ff58e5823bd095166564a006e47d111130813dcf8bf234ef79fa51a870edb48f"
 
 def load_categories(path):
     """General_Category of every code point (Cn for unassigned), from UnicodeData.txt."""
+    source = path or "https://www.unicode.org/Public/%s/ucd/UnicodeData.txt" % UNICODE_VERSION
     if path:
-        with open(path, encoding="utf-8") as f:
-            lines = f.read().splitlines()
+        with open(path, "rb") as f:
+            data = f.read()
     else:
-        url = "https://www.unicode.org/Public/%s/ucd/UnicodeData.txt" % UNICODE_VERSION
-        with urllib.request.urlopen(url) as r:
-            lines = r.read().decode("utf-8").splitlines()
+        with urllib.request.urlopen(source) as r:
+            data = r.read()
+    data = data.replace(b"\r\n", b"\n")
+    if hashlib.sha256(data).hexdigest() != UNICODE_DATA_SHA256:
+        sys.exit("%s is not UnicodeData.txt of Unicode %s (SHA-256 differs)" % (source, UNICODE_VERSION))
+    lines = data.decode("utf-8").splitlines()
     cats = ["Cn"] * 0x110000
     first = None
     for line in lines:
