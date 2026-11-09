@@ -59,8 +59,10 @@ endif()
 if(S2_CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
     # ggml leaves CUDA graphs off unless the parent project asks; the Fast-AR graphs are replayed
-    # with identical shapes every codebook step, which is exactly what they are for.
-    set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)
+    # with identical shapes every codebook step, which is exactly what they are for. This is only a
+    # default: -DGGML_CUDA_GRAPHS=OFF still turns capture off, and GGML_CUDA_DISABLE_GRAPHS=1 does so
+    # at run time.
+    set(GGML_CUDA_GRAPHS ON CACHE BOOL "ggml: use CUDA graphs")
 else()
     set(GGML_CUDA OFF CACHE BOOL "" FORCE)
 endif()
