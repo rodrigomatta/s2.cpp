@@ -159,7 +159,9 @@ static std::vector<std::string> pre_tokenize(const std::string & text) {
     const size_t n = cps.size();
     std::vector<std::string> out;
     size_t i = 0;
-    auto lower = [](uint32_t c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; };
+    // (?i:...) folds case the Unicode way. Of the letters in the contractions only U+017F (long s) folds to one of
+    // them ('s), so a long s after the apostrophe is a contraction like "'s".
+    auto lower = [](uint32_t c) { return (c >= 'A' && c <= 'Z') ? c + 32 : (c == 0x17F ? (uint32_t) 's' : c); };
     while (i < n) {
         size_t end = 0;
         const uint32_t c = cps[i];
