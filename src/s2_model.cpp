@@ -606,6 +606,9 @@ bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_
             weights_.embeddings_out = nullptr;
             weights_.fast_embeddings_gpu = nullptr;
         } else {
+            // They are weights: the scheduler then runs the matmul / get_rows that read them on this GPU
+            // (where the data is) instead of copying the whole table to the CPU for every step.
+            ggml_backend_buffer_set_usage(weights_.buf_extra, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             S2_LOG_INFO_STREAM("[Model] GPU copy of embedding tables: "
                       << ggml_backend_buffer_get_size(weights_.buf_extra) / 1048576.0 << " MB" << std::endl);
         }
