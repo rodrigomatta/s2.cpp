@@ -20,6 +20,7 @@
 #include <limits>
 #include <new>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace s2 {
 
@@ -64,7 +65,9 @@ struct AudioCodec::Impl {
     ggml_backend_t        backend   = nullptr;
     ggml_context *        ctx_w     = nullptr;
     ggml_backend_buffer_t model_buf = nullptr;
-    SlowARModel *         shared_model = nullptr; // owner of ctx_w when it is shared with the model
+    // The tensors this codec allocated. A context shared with the model also holds the model's tensors,
+    // which the model's own loader writes (and mirrors to its GPU copies); the codec never touches them.
+    std::unordered_set<const ggml_tensor *> own_tensors;
     std::string tprefix;
 
     int32_t sample_rate   = 0;
@@ -760,7 +763,7 @@ bool AudioCodec::load_shared(SlowARModel* Model, gguf_context * shared_gguf_ctx,
 
         gguf_free(local_gguf);
     }
-    else { impl_->ctx_w = Model->weights_.ctx_w; impl_->shared_model = Model; }
+    else { impl_->ctx_w = Model->weights_.ctx_w; }
 
     gguf_context * gguf_ctx = shared_gguf_ctx;
 
@@ -874,6 +877,11 @@ bool AudioCodec::load_shared(SlowARModel* Model, gguf_context * shared_gguf_ctx,
             streaming_history_frames_ = 160;
         }
 
+        // ggml_backend_alloc_ctx_tensors() allocates exactly the tensors that have no data yet; in a shared
+        // context the model has already allocated its own.
+        for (ggml_tensor * t = ggml_get_first_tensor(impl_->ctx_w); t; t = ggml_get_next_tensor(impl_->ctx_w, t)) {
+            if (t->data == nullptr && t->view_src == nullptr) impl_->own_tensors.insert(t);
+        }
         impl_->model_buf = ggml_backend_alloc_ctx_tensors(impl_->ctx_w, impl_->backend);
         if (!impl_->model_buf) throw std::runtime_error("ggml_backend_alloc_ctx_tensors() failed");
 
@@ -931,7 +939,7 @@ bool AudioCodec::read_tensor_data(const std::string & gguf_path, gguf_context * 
     for (int64_t ti = 0; ti < n_tensors; ++ti) {
         const char * name = gguf_get_tensor_name(gguf_ctx, ti);
         ggml_tensor * t = ggml_get_tensor(impl_->ctx_w, name);
-        if (!t) continue;
+        if (!t || impl_->own_tensors.count(t) == 0) continue;
         const size_t off   = data_offset + gguf_get_tensor_offset(gguf_ctx, ti);
         const size_t nbytes = ggml_nbytes(t);
         std::vector<uint8_t> tmp(nbytes);
@@ -946,8 +954,6 @@ bool AudioCodec::read_tensor_data(const std::string & gguf_path, gguf_context * 
             return false;
         }
         ggml_backend_tensor_set(t, tmp.data(), 0, nbytes);
-        // a shared context also holds the model's tensors, and the model keeps GPU copies of two of them
-        if (impl_->shared_model) impl_->shared_model->mirror_to_extra(t, tmp.data(), nbytes);
     }
     std::fclose(f);
     return refresh_host_caches();
