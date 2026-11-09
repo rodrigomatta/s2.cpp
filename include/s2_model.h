@@ -118,6 +118,10 @@ private:
     bool eval_cached(const std::vector<int32_t> & flat_tokens,
         int32_t n_tokens, int32_t n_threads,
         StepResult & result);
+    // One attempt; alloc_failed tells the caller that the graph did not fit in memory.
+    bool eval_cached_once(const std::vector<int32_t> & flat_tokens,
+        int32_t n_tokens, int32_t n_threads,
+        StepResult & result, bool & alloc_failed);
 public:
     bool prefill_fast(const std::vector<int32_t> & flat_tokens, int32_t n_tokens,
         int32_t n_threads, StepResult & result);
@@ -174,6 +178,14 @@ private:
                               const std::vector<int32_t> & prefix_codes,
                               int32_t n_threads,
                               std::vector<float> & logits_out);
+    bool fast_decode_uncached_once(const std::vector<float> & hidden,
+                                   const std::vector<int32_t> & prefix_codes,
+                                   int32_t n_threads,
+                                   std::vector<float> & logits_out, bool & alloc_failed);
+    // The GPU copies of the embedding tables are only a speed-up. When something inference needs does
+    // not fit in memory next to them, release them and run from the CPU tables again.
+    bool release_gpu_embedding_copies();
+    void free_gpu_embedding_copies();
     bool init_fast_cache();
     bool build_fast_graph(FastGraph & g, int32_t n_tok);
     bool run_fast_graph(FastGraph & g, const float * hidden, int32_t token,

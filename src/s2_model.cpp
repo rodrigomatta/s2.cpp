@@ -785,6 +785,11 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
     kv_buf_ = ggml_backend_alloc_ctx_tensors(ctx_kv_, kv_backend);
     if (!kv_buf_) {
         std::cerr << "[Model] Failed to allocate KV cache buffer." << std::endl;
+        // The GPU copies of the embedding tables may be what it did not fit next to: try again without them.
+        if (release_gpu_embedding_copies()) {
+            clear_kv_cache();
+            return init_kv_cache(max_seq_len);
+        }
         return false;
     }
 
@@ -895,6 +900,16 @@ bool SlowARModel::step(const std::vector<int32_t> & flat_tokens, int32_t n_threa
 bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
                                int32_t n_tokens, int32_t n_threads,
                                StepResult & result) {
+    bool alloc_failed = false;
+    if (eval_cached_once(flat_tokens, n_tokens, n_threads, result, alloc_failed)) return true;
+    // Nothing was written to the KV cache before the graph was allocated, so it can simply be run again.
+    if (!alloc_failed || !release_gpu_embedding_copies()) return false;
+    return eval_cached_once(flat_tokens, n_tokens, n_threads, result, alloc_failed);
+}
+
+bool SlowARModel::eval_cached_once(const std::vector<int32_t> & flat_tokens,
+                               int32_t n_tokens, int32_t n_threads,
+                               StepResult & result, bool & alloc_failed) {
     if (n_tokens <= 0) return false;
 
     const int32_t codebook_dim = hparams_.num_codebooks + 1;
@@ -1098,6 +1113,7 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
 
     if (!ggml_backend_sched_alloc_graph(sched_, gf)) {
         std::fprintf(stderr, "[eval_cached] sched alloc failed\n");
+        alloc_failed = true;
         ggml_backend_sched_reset(sched_);
         ggml_free(ctx0);
         return false;
@@ -1135,6 +1151,16 @@ bool SlowARModel::fast_decode_uncached(const std::vector<float> & hidden_in,
                                const std::vector<int32_t> & prefix_tokens,
                                int32_t n_threads,
                                std::vector<float> & logits_out) {
+    bool alloc_failed = false;
+    if (fast_decode_uncached_once(hidden_in, prefix_tokens, n_threads, logits_out, alloc_failed)) return true;
+    if (!alloc_failed || !release_gpu_embedding_copies()) return false;
+    return fast_decode_uncached_once(hidden_in, prefix_tokens, n_threads, logits_out, alloc_failed);
+}
+
+bool SlowARModel::fast_decode_uncached_once(const std::vector<float> & hidden_in,
+                               const std::vector<int32_t> & prefix_tokens,
+                               int32_t n_threads,
+                               std::vector<float> & logits_out, bool & alloc_failed) {
     if (!hparams_.has_fast_decoder) {
         std::fprintf(stderr, "[fast_decode] model has no fast decoder\n");
         return false;
@@ -1262,6 +1288,7 @@ bool SlowARModel::fast_decode_uncached(const std::vector<float> & hidden_in,
 
     if (!ggml_backend_sched_alloc_graph(fast_sched_, gf)) {
         std::fprintf(stderr, "[fast_decode] sched alloc failed\n");
+        alloc_failed = true;
         ggml_backend_sched_reset(fast_sched_);
         ggml_free(ctx0);
         return false;
@@ -1312,6 +1339,14 @@ bool SlowARModel::init_fast_cache() {
     ggml_init_params p = { (size_t)(2 * n_layer + 2) * ggml_tensor_overhead(), nullptr, true };
     fast_kv_ctx_ = ggml_init(p);
     if (!fast_kv_ctx_) { fast_cache_failed_ = true; return false; }
+    // Out of memory next to the GPU copies of the embedding tables: give those back and set up again.
+    auto fail = [this](const char * msg) {
+        std::cerr << msg << std::endl;
+        free_fast_cache();
+        if (release_gpu_embedding_copies()) return init_fast_cache();
+        fast_cache_failed_ = true;
+        return false;
+    };
     for (int32_t il = 0; il < n_layer; ++il) {
         fast_k_.push_back(ggml_new_tensor_2d(fast_kv_ctx_, GGML_TYPE_F32, kv_size, fast_cache_len_));
         fast_v_.push_back(ggml_new_tensor_2d(fast_kv_ctx_, GGML_TYPE_F32, kv_size, fast_cache_len_));
@@ -1319,18 +1354,12 @@ bool SlowARModel::init_fast_cache() {
     ggml_backend_t kv_backend = (n_gpu_layers_ > 0 && backend_gpu_) ? backend_gpu_ : backend_cpu_;
     fast_kv_buf_ = ggml_backend_alloc_ctx_tensors(fast_kv_ctx_, kv_backend);
     if (!fast_kv_buf_) {
-        std::cerr << "[Model] Fast-AR KV cache allocation failed; using the uncached path." << std::endl;
-        free_fast_cache();
-        fast_cache_failed_ = true;
-        return false;
+        return fail("[Model] Fast-AR KV cache allocation failed; using the uncached path.");
     }
     ggml_backend_buffer_clear(fast_kv_buf_, 0);
 
     if (!build_fast_graph(fast_graph_[0], 1) || !build_fast_graph(fast_graph_[1], 2)) {
-        std::cerr << "[Model] Fast-AR graph setup failed; using the uncached path." << std::endl;
-        free_fast_cache();
-        fast_cache_failed_ = true;
-        return false;
+        return fail("[Model] Fast-AR graph setup failed; using the uncached path.");
     }
     return true;
 }
@@ -1349,6 +1378,24 @@ void SlowARModel::free_fast_cache() {
     fast_v_.clear();
     fast_cached_hidden_.clear();
     fast_cached_prefix_.clear();
+}
+
+void SlowARModel::free_gpu_embedding_copies() {
+    free_fast_cache();                       // its graphs read the Fast-AR copy
+    if (weights_.buf_extra) ggml_backend_buffer_free(weights_.buf_extra);
+    if (weights_.ctx_extra) ggml_free(weights_.ctx_extra);
+    weights_.buf_extra = nullptr;
+    weights_.ctx_extra = nullptr;
+    weights_.embeddings_out = nullptr;
+    weights_.fast_embeddings_gpu = nullptr;
+}
+
+bool SlowARModel::release_gpu_embedding_copies() {
+    if (!weights_.embeddings_out && !weights_.fast_embeddings_gpu) return false;
+    std::cerr << "[Model] Not enough GPU memory next to the GPU copy of the embedding tables; "
+                 "releasing it and using the CPU tables." << std::endl;
+    free_gpu_embedding_copies();
+    return true;
 }
 
 bool SlowARModel::build_fast_graph(FastGraph & g, int32_t n_tok) {
