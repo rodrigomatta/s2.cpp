@@ -206,6 +206,11 @@ SlowARModel::~SlowARModel() {
 
 bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_path, int32_t gpu_device, BackendType backend_type, int32_t n_gpu_layers) {
 
+    // Loading again replaces the weights tensors. The cached Fast-AR graphs and the GPU copies of the
+    // embedding tables still point at the previous ones: drop them so they are rebuilt from the new weights.
+    free_gpu_embedding_copies();
+    fast_cache_failed_ = false;
+
     backend_cpu_ = ggml_backend_cpu_init();
     if (!backend_cpu_) {
         std::cerr << "[Model] Failed to init CPU backend." << std::endl;
