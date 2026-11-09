@@ -140,7 +140,7 @@ static bool is_N(uint32_t c) { return in_ranges(kUniNumber, c); }
 static bool is_S(uint32_t c) { return in_ranges(kUniSpace, c); }
 static bool is_NL(uint32_t c) { return c == '\r' || c == '\n'; }
 
-static std::vector<std::string> pre_tokenize(const std::string & text) {
+std::vector<std::string> pre_tokenize(const std::string & text) {
     // decode to code points, remembering byte offsets
     std::vector<uint32_t> cps;
     std::vector<size_t> off;
